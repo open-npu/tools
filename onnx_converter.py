@@ -28,7 +28,7 @@ from model_packer import (
     LayerConfig, PerChannelParam, AddParam, pack_model,
     OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD,
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
-    PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_PASSTHROUGH,
+    PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_RELU_ONLY, PPU_MODE_PASSTHROUGH,
 )
 
 
@@ -319,11 +319,102 @@ def compute_requant_params(scale_in, scale_w_perchannel, scale_out, bias_float=N
 
 # ─── Graph Fusion ───
 
+def fold_batchnorm(nodes, weights):
+    """Fold BatchNormalization into preceding Conv weight/bias (float32 level).
+
+    For each BN node immediately following a Conv:
+        w_new = w * (gamma / sqrt(var + eps))
+        b_new = (b - mean) * (gamma / sqrt(var + eps)) + beta
+
+    Modifies weights dict in-place and removes BN nodes from graph.
+    Returns filtered nodes list.
+    """
+    # Map: output_tensor_name → node (to find Conv preceding BN)
+    output_to_node = {}
+    for node in nodes:
+        for out in node.outputs:
+            output_to_node[out] = node
+
+    bn_outputs_to_conv_output = {}  # BN output → Conv output (for redirect)
+    bn_nodes_to_remove = set()
+
+    for node in nodes:
+        if node.op_type != 'BatchNormalization':
+            continue
+
+        # BN inputs: [x, gamma, beta, mean, var]
+        if len(node.inputs) < 5:
+            continue
+
+        bn_input = node.inputs[0]
+        conv_node = output_to_node.get(bn_input)
+        if conv_node is None or conv_node.op_type != 'Conv':
+            continue
+
+        # Extract BN parameters from weights
+        gamma = weights.get(node.inputs[1])
+        beta = weights.get(node.inputs[2])
+        mean = weights.get(node.inputs[3])
+        var = weights.get(node.inputs[4])
+        if gamma is None or beta is None or mean is None or var is None:
+            continue
+
+        eps = node.attrs.get('epsilon', 1e-5)
+
+        # Compute fold factors
+        inv_std = gamma / np.sqrt(var + eps)  # shape [C]
+        C = inv_std.shape[0]
+
+        # Fold into Conv weight
+        conv_weight_name = conv_node.inputs[1]
+        w = weights[conv_weight_name]  # [OC, IC/g, KH, KW] or [OC, 1, KH, KW] for DW
+        w_new = w * inv_std.reshape(C, *([1] * (w.ndim - 1)))
+        weights[conv_weight_name] = w_new
+        conv_node.weight = w_new
+
+        # Fold into Conv bias (create if absent)
+        if len(conv_node.inputs) > 2 and conv_node.inputs[2] in weights:
+            bias_name = conv_node.inputs[2]
+            b = weights[bias_name]
+        else:
+            # No bias — create zero bias and add to Conv inputs
+            b = np.zeros(C, dtype=np.float32)
+            bias_name = conv_weight_name + '_folded_bias'
+            if len(conv_node.inputs) <= 2:
+                conv_node.inputs.append(bias_name)
+            else:
+                conv_node.inputs[2] = bias_name
+
+        b_new = (b - mean) * inv_std + beta
+        weights[bias_name] = b_new
+        conv_node.bias = b_new
+
+        # Redirect: BN output → Conv output (downstream nodes use Conv output)
+        bn_output = node.outputs[0]
+        conv_output = conv_node.outputs[0]
+        bn_outputs_to_conv_output[bn_output] = conv_output
+        bn_nodes_to_remove.add(id(node))
+
+    if not bn_nodes_to_remove:
+        return nodes
+
+    # Redirect all downstream references from BN outputs to Conv outputs
+    for node in nodes:
+        for i, inp in enumerate(node.inputs):
+            if inp in bn_outputs_to_conv_output:
+                node.inputs[i] = bn_outputs_to_conv_output[inp]
+
+    # Remove BN nodes
+    filtered = [n for n in nodes if id(n) not in bn_nodes_to_remove]
+    print(f"  Folded {len(bn_nodes_to_remove)} BatchNorm nodes into Conv")
+    return filtered
+
+
 def fuse_graph(nodes, weights):
     """Fuse Relu/Clip into preceding Conv/Add nodes, skip Reshape/Constant.
 
     Returns list of fused operation descriptors:
-        {type: 'conv'/'dw'/'add', node: OnnxNode, relu: bool, relu6: bool, ...}
+        {type: 'conv'/'dw'/'add'/'pool', node: OnnxNode, relu: bool, relu6: bool, ...}
     """
     fused = []
     output_to_op = {}  # tensor_name → index in fused list
@@ -373,8 +464,8 @@ def fuse_graph(nodes, weights):
     for node in nodes:
         if node.op_type in ('Relu', 'Clip'):
             continue  # handled by fusion
-        if node.op_type in ('Constant', 'Reshape'):
-            continue  # skip utility ops
+        if node.op_type in ('Constant', 'Reshape', 'BatchNormalization'):
+            continue  # skip utility ops (BN should already be folded)
 
         if node.op_type == 'Conv':
             group = node.attrs.get('group', 1)
@@ -394,6 +485,17 @@ def fuse_graph(nodes, weights):
             out_tensor = node.outputs[0]
             op = {
                 'type': 'add',
+                'node': node,
+                'relu': out_tensor in relu_inputs,
+                'relu6': out_tensor in relu6_inputs,
+                'relu_output': relu_inputs.get(out_tensor) or relu6_inputs.get(out_tensor),
+            }
+            fused.append(op)
+
+        elif node.op_type in ('MaxPool', 'AveragePool', 'GlobalAveragePool'):
+            out_tensor = node.outputs[0]
+            op = {
+                'type': 'pool',
                 'node': node,
                 'relu': out_tensor in relu_inputs,
                 'relu6': out_tensor in relu6_inputs,
@@ -421,6 +523,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     print("\n=== Running PTQ Calibration ===")
     act_ranges, act_percentiles = calibrate_model(model_path, calib_dir, input_shape, num_calib)
 
+    # 2.5. Fold BatchNorm into Conv (graph optimization, float32 level)
+    print("\n=== Folding BatchNorm ===")
+    nodes = fold_batchnorm(nodes, all_weights)
+
     # 3. Fuse graph
     print("\n=== Fusing graph ===")
     fused_ops = fuse_graph(nodes, all_weights)
@@ -431,6 +537,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             n = op['node']
             ks = n.attrs.get('kernel_shape', [1, 1])
             print(f"    [{i:2d}] {op['type'].upper():4s} {ks} {n.input_shape} → {n.output_shape} {act_str}")
+        elif op['type'] == 'pool':
+            n = op['node']
+            print(f"    [{i:2d}] POOL {n.op_type} {n.input_shape} → {n.output_shape} {act_str}")
         else:
             n = op['node']
             print(f"    [{i:2d}] ADD  {n.input_shape} {act_str}")
@@ -678,6 +787,75 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
             tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
 
+        elif op['type'] == 'pool':
+            # Pooling: no weight, passthrough quantization
+            input_tensor = node.inputs[0]
+            if input_tensor not in tensor_quant:
+                r = get_range(input_tensor)
+                s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
+                tensor_quant[input_tensor] = (s, z)
+            scale_in, zp_in = tensor_quant[input_tensor]
+
+            # Output scale from calibration (pooling doesn't change scale much)
+            out_range = get_range(eff_output, is_relu_output=has_act)
+            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
+            tensor_quant[eff_output] = (scale_out, zp_out)
+
+            # Dimensions
+            _, _, ih, iw = node.input_shape if node.input_shape else [1, 1, 1, 1]
+            ic = node.input_shape[1] if node.input_shape else 1
+            _, oc, oh, ow = node.output_shape if node.output_shape else [1, 1, 1, 1]
+
+            # Parse pooling attributes
+            is_global = (node.op_type == 'GlobalAveragePool')
+            pool_mode = 0 if node.op_type == 'MaxPool' else 1  # 0=Max, 1=Avg
+
+            if is_global:
+                kernel_shape = [ih, iw]
+                pool_strides = [ih, iw]
+                pads = [0, 0, 0, 0]
+            else:
+                kernel_shape = node.attrs.get('kernel_shape', [2, 2])
+                pool_strides = node.attrs.get('strides', [2, 2])
+                pads = node.attrs.get('pads', [0, 0, 0, 0])
+
+            # Post-processing: pooling uses PASSTHROUGH (values stay in range)
+            # If followed by activation, use RELU_ONLY for clamp+relu
+            post_ctrl = PPU_MODE_PASSTHROUGH
+            if bits == 16:
+                post_ctrl |= POST_INT16_OUT
+            if op.get('relu6'):
+                post_ctrl |= POST_RELU6_EN
+                post_ctrl = (post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
+            elif op['relu']:
+                post_ctrl |= POST_RELU_EN
+                post_ctrl = (post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
+
+            cfg = LayerConfig(
+                op_type=OP_POOLING,
+                data_type=1 if bits == 16 else 0,
+                in_h=ih, in_w=iw, in_c=ic,
+                out_h=oh, out_w=ow, out_c=oc,
+                pool_mode=pool_mode,
+                pool_h=kernel_shape[0], pool_w=kernel_shape[1],
+                pool_stride_h=pool_strides[0], pool_stride_w=pool_strides[1],
+                global_pool=1 if is_global else 0,
+                pad_top=pads[0], pad_bottom=pads[2] if len(pads) > 2 else pads[0],
+                pad_left=pads[1] if len(pads) > 1 else 0,
+                pad_right=pads[3] if len(pads) > 3 else (pads[1] if len(pads) > 1 else 0),
+                post_ctrl=post_ctrl,
+                clamp_min=qmin, clamp_max=qmax,
+            )
+
+            print(f"    Pool[{len(npu_layers)}]: {node.op_type} "
+                  f"k={kernel_shape} s={pool_strides} "
+                  f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
+
+            npu_layers.append(cfg)
+            tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
+            tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
+            # No weight blob for pooling
+
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")
     all_weights_bin = b''.join(weight_blobs)
@@ -686,9 +864,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     # 6. Prepare input tensor
     print(f"\n=== Preparing input tensor ===")
     if input_format == 'int8-nchw':
-        # Read int8 NCHW, quantize to target bit-width for NPU
-        raw = np.fromfile(input_path, dtype=np.int8).reshape(input_shape)
-        # Input preprocessing: float = (int8 - 127.5) / 255
+        # Read raw pixel bytes (uint8 NCHW), quantize to target bit-width for NPU
+        raw = np.fromfile(input_path, dtype=np.uint8).reshape(input_shape)
+        # Input preprocessing matches calibration: float = (pixel_uint8 - 127.5) / 255
         # input_q = round(float_val / in_scale)
         float_val = (raw.astype(np.float32) - 127.5) / 255.0
         input_q = np.round(float_val / in_scale).astype(np.int32)
