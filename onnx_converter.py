@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_packer import (
     LayerConfig, PerChannelParam, AddParam, pack_model,
     OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD,
-    POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_INT16_OUT,
+    POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
     PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_PASSTHROUGH,
 )
 
@@ -319,26 +319,59 @@ def compute_requant_params(scale_in, scale_w_perchannel, scale_out, bias_float=N
 
 # ─── Graph Fusion ───
 
-def fuse_graph(nodes):
-    """Fuse Relu into preceding Conv/Add nodes, skip Reshape/Constant.
+def fuse_graph(nodes, weights):
+    """Fuse Relu/Clip into preceding Conv/Add nodes, skip Reshape/Constant.
 
     Returns list of fused operation descriptors:
-        {type: 'conv'/'dw'/'add', node: OnnxNode, relu: bool, ...}
+        {type: 'conv'/'dw'/'add', node: OnnxNode, relu: bool, relu6: bool, ...}
     """
     fused = []
     output_to_op = {}  # tensor_name → index in fused list
 
-    skip_outputs = set()  # outputs that are consumed by fused relu
+    skip_outputs = set()  # outputs that are consumed by fused relu/clip
 
-    # First pass: mark relu nodes that can be fused
-    relu_inputs = {}  # relu_input_tensor → relu_output_tensor
+    # First pass: mark relu/clip nodes that can be fused
+    relu_inputs = {}   # input_tensor → output_tensor (for Relu)
+    relu6_inputs = {}  # input_tensor → output_tensor (for Clip(0,6) aka ReLU6)
     for node in nodes:
         if node.op_type == 'Relu':
             relu_inputs[node.inputs[0]] = node.outputs[0]
+        elif node.op_type == 'Clip':
+            # Detect Clip(min=0, max=6) as ReLU6
+            # ONNX opset 11+: inputs = [input, min, max]
+            # ONNX opset 6:  attributes min/max
+            clip_min, clip_max = None, None
+            if len(node.inputs) >= 3:
+                # opset 11+: min/max are constant inputs
+                min_name = node.inputs[1] if len(node.inputs) > 1 else ''
+                max_name = node.inputs[2] if len(node.inputs) > 2 else ''
+                if min_name and min_name in weights:
+                    clip_min = float(weights[min_name].flatten()[0])
+                elif min_name == '':
+                    clip_min = None  # unbounded
+                if max_name and max_name in weights:
+                    clip_max = float(weights[max_name].flatten()[0])
+                elif max_name == '':
+                    clip_max = None  # unbounded
+            else:
+                # opset 6: attributes
+                clip_min = node.attrs.get('min', None)
+                clip_max = node.attrs.get('max', None)
+
+            if clip_min is not None and clip_min == 0.0 and clip_max is not None and clip_max == 6.0:
+                # ReLU6
+                relu6_inputs[node.inputs[0]] = node.outputs[0]
+            elif clip_min is not None and clip_min == 0.0 and clip_max is None:
+                # Just ReLU
+                relu_inputs[node.inputs[0]] = node.outputs[0]
+            else:
+                # General Clip — treat as ReLU6 if min=0 (use max as clamp)
+                if clip_min is not None and clip_min == 0.0 and clip_max is not None:
+                    relu6_inputs[node.inputs[0]] = node.outputs[0]
 
     # Second pass: build fused ops
     for node in nodes:
-        if node.op_type == 'Relu':
+        if node.op_type in ('Relu', 'Clip'):
             continue  # handled by fusion
         if node.op_type in ('Constant', 'Reshape'):
             continue  # skip utility ops
@@ -347,20 +380,24 @@ def fuse_graph(nodes):
             group = node.attrs.get('group', 1)
             is_dw = (group > 1 and node.weight is not None and
                      group == node.weight.shape[0])
+            out_tensor = node.outputs[0]
             op = {
                 'type': 'dw' if is_dw else 'conv',
                 'node': node,
-                'relu': node.outputs[0] in relu_inputs,
-                'relu_output': relu_inputs.get(node.outputs[0]),
+                'relu': out_tensor in relu_inputs,
+                'relu6': out_tensor in relu6_inputs,
+                'relu_output': relu_inputs.get(out_tensor) or relu6_inputs.get(out_tensor),
             }
             fused.append(op)
 
         elif node.op_type == 'Add':
+            out_tensor = node.outputs[0]
             op = {
                 'type': 'add',
                 'node': node,
-                'relu': node.outputs[0] in relu_inputs,
-                'relu_output': relu_inputs.get(node.outputs[0]),
+                'relu': out_tensor in relu_inputs,
+                'relu6': out_tensor in relu6_inputs,
+                'relu_output': relu_inputs.get(out_tensor) or relu6_inputs.get(out_tensor),
             }
             fused.append(op)
 
@@ -386,17 +423,17 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     # 3. Fuse graph
     print("\n=== Fusing graph ===")
-    fused_ops = fuse_graph(nodes)
+    fused_ops = fuse_graph(nodes, all_weights)
     print(f"  Fused ops: {len(fused_ops)}")
     for i, op in enumerate(fused_ops):
-        relu_str = '+ReLU' if op['relu'] else ''
+        act_str = '+ReLU6' if op.get('relu6') else ('+ReLU' if op['relu'] else '')
         if op['type'] in ('conv', 'dw'):
             n = op['node']
             ks = n.attrs.get('kernel_shape', [1, 1])
-            print(f"    [{i:2d}] {op['type'].upper():4s} {ks} {n.input_shape} → {n.output_shape} {relu_str}")
+            print(f"    [{i:2d}] {op['type'].upper():4s} {ks} {n.input_shape} → {n.output_shape} {act_str}")
         else:
             n = op['node']
-            print(f"    [{i:2d}] ADD  {n.input_shape} {relu_str}")
+            print(f"    [{i:2d}] ADD  {n.input_shape} {act_str}")
 
     # 4. Quantize each layer
     print(f"\n=== Quantizing layers (INT{bits} per-channel) ===")
@@ -446,8 +483,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     for i, op in enumerate(fused_ops):
         node = op['node']
-        # Determine the effective output tensor name (after relu fusion)
-        if op['relu'] and op['relu_output']:
+        # Determine the effective output tensor name (after relu/clip fusion)
+        has_act = op['relu'] or op.get('relu6', False)
+        if has_act and op['relu_output']:
             eff_output = op['relu_output']
         else:
             eff_output = node.outputs[0]
@@ -467,7 +505,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             bias = node.bias
 
             # Determine output scale from activation ranges
-            out_range = get_range(eff_output, is_relu_output=op['relu'])
+            out_range = get_range(eff_output, is_relu_output=has_act)
             scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
             tensor_quant[eff_output] = (scale_out, zp_out)
 
@@ -503,7 +541,12 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             )
             if bits == 16:
                 cfg.post_ctrl |= POST_INT16_OUT
-            if op['relu']:
+            if op.get('relu6'):
+                cfg.post_ctrl |= POST_RELU6_EN
+                # ReLU6: clamp_max = min(qmax, round(6.0 / scale_out))
+                relu6_qmax = int(np.round(6.0 / scale_out))
+                cfg.clamp_max = min(qmax, relu6_qmax)
+            elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
             if zp_out != 0:
                 cfg.post_ctrl |= POST_ZP_EN
@@ -552,7 +595,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             scale_b, _ = tensor_quant[input_b_name]
 
             # Output scale
-            out_range = get_range(eff_output, is_relu_output=op['relu'])
+            out_range = get_range(eff_output, is_relu_output=has_act)
             scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
             tensor_quant[eff_output] = (scale_out, zp_out)
 
@@ -587,7 +630,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             )
             if bits == 16:
                 cfg.post_ctrl |= POST_INT16_OUT
-            if op['relu']:
+            if op.get('relu6'):
+                cfg.post_ctrl |= POST_RELU6_EN
+                relu6_qmax = int(np.round(6.0 / scale_out))
+                cfg.clamp_max = min(qmax, relu6_qmax)
+            elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
 
             cfg.add_params = AddParam(M_A=M_A, S_A=S_A, M_B=M_B, S_B=S_B)
