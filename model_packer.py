@@ -51,20 +51,20 @@ POST_INT16_OUT = (1 << 7)
 
 @dataclass
 class PerChannelParam:
-    """Per-channel requantize parameters (10 bytes)."""
+    """Per-channel requantize parameters (14 bytes)."""
     M: int = 1       # 15-bit unsigned multiplier
     S: int = 0       # 6-bit shift amount
     zp: int = 0      # 16-bit signed zero point
-    bias_q: int = 0  # 32-bit signed bias
+    bias_q: int = 0  # 64-bit signed bias
 
     def pack(self) -> bytes:
-        """Pack to 10 bytes matching perchannel_param_t."""
-        return struct.pack('<HBbhI',
+        """Pack to 14 bytes matching perchannel_param_t."""
+        return struct.pack('<HBbhq',
                            self.M & 0x7FFF,  # uint16 M
                            self.S & 0x3F,     # uint8 S
                            0,                 # reserved
                            self.zp,           # int16 zp
-                           self.bias_q & 0xFFFFFFFF)  # uint32 (store as unsigned bits)
+                           self.bias_q)       # int64 bias
 
     @staticmethod
     def pack_array(params: list) -> bytes:
@@ -136,6 +136,8 @@ class LayerConfig:
     ch_params: List[PerChannelParam] = field(default_factory=list)
     # Add params (single AddParam or None)
     add_params: Optional[AddParam] = None
+    # Residual source layer index (-1 = none)
+    residual_src: int = -1
     # LUT data
     lut_i8: bytes = field(default_factory=lambda: bytes(256))
     lut_i16: bytes = field(default_factory=lambda: bytes(512))
@@ -196,7 +198,7 @@ class LayerConfig:
         w16(len(self.ch_params))  # 55: param_ch_count
         w8(1 if self.has_lut else 0)  # 57: has_lut
         w8(1 if self.add_params else 0)  # 58: has_add
-        w8(0)                  # 59: _reserved[1]
+        w8s(self.residual_src)  # 59: residual_src (-1=none)
 
         assert off == FIXED_CONFIG_SIZE, f"Expected {FIXED_CONFIG_SIZE}, got {off}"
         return bytes(buf)
