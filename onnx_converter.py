@@ -26,7 +26,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_packer import (
     LayerConfig, PerChannelParam, AddParam, pack_model,
-    OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD, OP_CONCAT,
+    OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD, OP_RESIZE, OP_CONCAT,
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
     PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_RELU_ONLY, PPU_MODE_PASSTHROUGH,
 )
@@ -76,6 +76,8 @@ class OnnxNode:
                 self.attrs[a.name] = a.f
             elif a.type == onnx.AttributeProto.FLOATS:
                 self.attrs[a.name] = list(a.floats)
+            elif a.type == onnx.AttributeProto.STRING:
+                self.attrs[a.name] = a.s.decode('utf-8')
 
         # Resolve weight and bias
         self.weight = weights.get(node.input[1]) if len(node.input) > 1 else None
@@ -545,6 +547,17 @@ def fuse_graph(nodes, weights):
             }
             fused.append(op)
 
+        elif node.op_type in ('Resize', 'Upsample'):
+            out_tensor = node.outputs[0]
+            op = {
+                'type': 'resize',
+                'node': node,
+                'relu': out_tensor in relu_inputs,
+                'relu6': out_tensor in relu6_inputs,
+                'relu_output': relu_inputs.get(out_tensor) or relu6_inputs.get(out_tensor),
+            }
+            fused.append(op)
+
     return fused, passthrough_map
 
 
@@ -600,6 +613,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             n = op['node']
             n_inputs = len([inp for inp in n.inputs if inp not in all_weights])
             print(f"    [{i:2d}] CAT  {n_inputs} inputs → {n.output_shape} {act_str}")
+        elif op['type'] == 'resize':
+            n = op['node']
+            print(f"    [{i:2d}] RSZ  {n.op_type} {n.input_shape} → {n.output_shape} {act_str}")
         else:
             n = op['node']
             print(f"    [{i:2d}] ADD  {n.input_shape} {act_str}")
@@ -1162,6 +1178,96 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
             print(f"    Concat[{len(npu_layers)-len(concat_inputs)}..{len(npu_layers)-1}]: "
                   f"{len(concat_inputs)} branches, channels={input_channels}, total={total_c}")
+
+        elif op['type'] == 'resize':
+            # Resize/Upsample: no weights, passthrough quantization
+            # csim uses in_h/in_w/out_h/out_w + resize_mode to compute output
+            input_tensor = node.inputs[0]
+            if get_tensor_quant(input_tensor) is None:
+                r = get_range(input_tensor)
+                s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
+                tensor_quant[input_tensor] = (s, z)
+            scale_in, zp_in = tensor_quant[input_tensor]
+
+            # Determine resize mode from ONNX attributes
+            # Resize (opset 11+): mode attribute = "nearest" or "linear"
+            # Upsample (opset 7-9): mode attribute = "nearest" or "linear"/"bilinear"
+            mode_str = node.attrs.get('mode', 'nearest')
+            if mode_str in ('linear', 'bilinear'):
+                resize_mode = 1  # bilinear
+            else:
+                resize_mode = 0  # nearest
+
+            # Determine output size from ONNX Resize inputs/attributes
+            # Opset 11+ Resize: inputs = [X, roi, scales, sizes]
+            #   - If sizes is provided (non-empty), use it for output shape
+            #   - Else use scales to compute output shape
+            # Opset 7-9 Upsample: inputs = [X, scales] or attribute 'scales'
+            _, _, ih, iw = node.input_shape if node.input_shape else [1, 1, 1, 1]
+            ic = node.input_shape[1] if node.input_shape else 1
+
+            if node.output_shape:
+                # Shape inference gave us the output shape directly
+                _, oc, oh, ow = node.output_shape
+            else:
+                # Fallback: compute from scales
+                scales = None
+                if node.op_type == 'Upsample' and 'scales' in node.attrs:
+                    scales = node.attrs['scales']
+                elif len(node.inputs) >= 3 and node.inputs[2] in all_weights:
+                    scales = all_weights[node.inputs[2]].flatten().tolist()
+                elif len(node.inputs) >= 4 and node.inputs[3] in all_weights:
+                    sizes = all_weights[node.inputs[3]].flatten().tolist()
+                    oh, ow = int(sizes[2]), int(sizes[3])
+                    oc = ic
+                    scales = None
+
+                if scales is not None and len(scales) >= 4:
+                    oh = int(ih * scales[2])
+                    ow = int(iw * scales[3])
+                    oc = ic
+                elif scales is not None and len(scales) == 2:
+                    oh = int(ih * scales[0])
+                    ow = int(iw * scales[1])
+                    oc = ic
+                elif 'oh' not in dir():
+                    # Last fallback: assume 2x
+                    oh, ow, oc = ih * 2, iw * 2, ic
+
+            # Output quant: passthrough (same scale as input)
+            # For nearest, values are identical to input pixels
+            # For bilinear, interpolation stays within input range
+            out_range = get_range(eff_output, is_relu_output=has_act)
+            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
+            tensor_quant[eff_output] = (scale_out, zp_out)
+
+            post_ctrl = PPU_MODE_PASSTHROUGH
+            if bits == 16:
+                post_ctrl |= POST_INT16_OUT
+            if op.get('relu6'):
+                post_ctrl |= POST_RELU6_EN
+                post_ctrl = (post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
+            elif op['relu']:
+                post_ctrl |= POST_RELU_EN
+                post_ctrl = (post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
+
+            cfg = LayerConfig(
+                op_type=OP_RESIZE,
+                data_type=1 if bits == 16 else 0,
+                in_h=ih, in_w=iw, in_c=ic,
+                out_h=oh, out_w=ow, out_c=oc,
+                resize_mode=resize_mode,
+                post_ctrl=post_ctrl,
+                clamp_min=qmin, clamp_max=qmax,
+            )
+
+            npu_layers.append(cfg)
+            tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
+            tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
+
+            mode_name = 'bilinear' if resize_mode == 1 else 'nearest'
+            print(f"    Resize[{len(npu_layers)-1}]: {mode_name} "
+                  f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
 
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")
