@@ -26,7 +26,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_packer import (
     LayerConfig, PerChannelParam, AddParam, pack_model,
-    OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD,
+    OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD, OP_CONCAT,
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
     PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_RELU_ONLY, PPU_MODE_PASSTHROUGH,
 )
@@ -534,6 +534,17 @@ def fuse_graph(nodes, weights):
             }
             fused.append(op)
 
+        elif node.op_type == 'Concat':
+            out_tensor = node.outputs[0]
+            op = {
+                'type': 'concat',
+                'node': node,
+                'relu': out_tensor in relu_inputs,
+                'relu6': out_tensor in relu6_inputs,
+                'relu_output': relu_inputs.get(out_tensor) or relu6_inputs.get(out_tensor),
+            }
+            fused.append(op)
+
     return fused, passthrough_map
 
 
@@ -585,6 +596,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         elif op['type'] == 'fc':
             n = op['node']
             print(f"    [{i:2d}] FC   {n.op_type} {n.input_shape} → {n.output_shape} {act_str}")
+        elif op['type'] == 'concat':
+            n = op['node']
+            n_inputs = len([inp for inp in n.inputs if inp not in all_weights])
+            print(f"    [{i:2d}] CAT  {n_inputs} inputs → {n.output_shape} {act_str}")
         else:
             n = op['node']
             print(f"    [{i:2d}] ADD  {n.input_shape} {act_str}")
@@ -1050,6 +1065,103 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             print(f"    FC[{len(npu_layers)-1}]: {node.op_type} "
                   f"{in_c} → {out_c}"
                   f"{' +ReLU6' if op.get('relu6') else ' +ReLU' if op['relu'] else ''}")
+
+        elif op['type'] == 'concat':
+            # Concat: emit one sub-layer per input branch
+            # Each sub-layer copies its input channels into the output at concat_offset
+            # No requantization — passthrough (values stay in same quantized domain)
+            axis = node.attrs.get('axis', 1)  # typically axis=1 (channel dim in NCHW)
+
+            # Get all non-weight inputs (the data inputs to concat)
+            concat_inputs = [inp for inp in node.inputs if inp not in all_weights]
+
+            # Determine total output channels and per-input channel counts
+            total_c = 0
+            input_channels = []
+            for inp_name in concat_inputs:
+                resolved = resolve_passthrough(inp_name)
+                # Find shape: check shape_map via nodes or calibration data
+                inp_shape = None
+                for n in nodes:
+                    if n.outputs and n.outputs[0] == resolved and n.output_shape:
+                        inp_shape = n.output_shape
+                        break
+                    if n.outputs and n.outputs[0] == inp_name and n.output_shape:
+                        inp_shape = n.output_shape
+                        break
+                if inp_shape is None and node.output_shape:
+                    # Fallback: can't determine individual input shape
+                    # This shouldn't happen with shape inference
+                    print(f"  WARNING: Can't determine shape for concat input '{inp_name}'")
+                    continue
+                # Channel dim depends on axis (NCHW: axis=1 → dim[1])
+                c = inp_shape[axis] if inp_shape else 0
+                input_channels.append(c)
+                total_c += c
+
+            # Verify against output shape
+            if node.output_shape:
+                expected_total_c = node.output_shape[axis]
+                if total_c != expected_total_c:
+                    # Use output shape as ground truth
+                    total_c = expected_total_c
+
+            # Spatial dimensions from output
+            if node.output_shape and len(node.output_shape) == 4:
+                _, _, oh, ow = node.output_shape
+            else:
+                oh, ow = 1, 1
+
+            # Emit one Concat sub-layer per input
+            offset = 0
+            for branch_idx, (inp_name, ch_count) in enumerate(
+                    zip(concat_inputs, input_channels)):
+                # Resolve quantization for this input
+                if get_tensor_quant(inp_name) is None:
+                    r = get_range(inp_name)
+                    s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
+                    tensor_quant[inp_name] = (s, z)
+
+                # Determine source layer for residual_src
+                resolved_inp = resolve_passthrough(inp_name)
+                src_layer_idx = tensor_to_layer_idx.get(inp_name,
+                    tensor_to_layer_idx.get(resolved_inp, -1))
+
+                # For the first sub-layer: if source is immediately preceding,
+                # use -1 (current); otherwise use residual_src
+                prev_layer_idx = len(npu_layers) - 1
+                if branch_idx == 0 and src_layer_idx == prev_layer_idx:
+                    residual = -1  # read from current
+                else:
+                    residual = src_layer_idx
+
+                cfg = LayerConfig(
+                    op_type=OP_CONCAT,
+                    data_type=1 if bits == 16 else 0,
+                    in_h=oh, in_w=ow, in_c=ch_count,
+                    out_h=oh, out_w=ow, out_c=total_c,
+                    concat_offset=offset,
+                    concat_total_c=total_c,
+                    post_ctrl=PPU_MODE_PASSTHROUGH,
+                    clamp_min=qmin, clamp_max=qmax,
+                    residual_src=residual,
+                )
+                if bits == 16:
+                    cfg.post_ctrl |= POST_INT16_OUT
+
+                npu_layers.append(cfg)
+                offset += ch_count
+
+            # Track the concat output tensor
+            # Use calibrated range for the concat output (covers both branches)
+            out_range = get_range(eff_output)
+            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
+            tensor_quant[eff_output] = (scale_out, zp_out)
+            tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
+            tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
+
+            print(f"    Concat[{len(npu_layers)-len(concat_inputs)}..{len(npu_layers)-1}]: "
+                  f"{len(concat_inputs)} branches, channels={input_channels}, total={total_c}")
 
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")
