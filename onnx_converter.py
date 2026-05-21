@@ -411,15 +411,34 @@ def fold_batchnorm(nodes, weights):
 
 
 def fuse_graph(nodes, weights):
-    """Fuse Relu/Clip into preceding Conv/Add nodes, skip Reshape/Constant.
+    """Fuse Relu/Clip into preceding Conv/Add nodes, skip shape-only ops.
 
-    Returns list of fused operation descriptors:
-        {type: 'conv'/'dw'/'add'/'pool', node: OnnxNode, relu: bool, relu6: bool, ...}
+    Returns:
+        fused: list of fused operation descriptors
+            {type: 'conv'/'dw'/'add'/'pool'/'fc', node: OnnxNode, relu: bool, relu6: bool, ...}
+        passthrough_map: dict { output_tensor → input_tensor } for shape-only ops
+            (Reshape, Flatten, Squeeze, Unsqueeze) — used to propagate quantization params
     """
     fused = []
     output_to_op = {}  # tensor_name → index in fused list
 
     skip_outputs = set()  # outputs that are consumed by fused relu/clip
+
+    # Build passthrough map: shape-only ops redirect output → input
+    # (these ops don't change values, just tensor shape)
+    passthrough_map = {}  # output_name → input_name (the data source)
+    for node in nodes:
+        if node.op_type in ('Reshape', 'Flatten', 'Squeeze', 'Unsqueeze'):
+            passthrough_map[node.outputs[0]] = node.inputs[0]
+
+    # Resolve transitive passthrough (e.g. Reshape → Flatten chain)
+    def resolve_passthrough(tensor_name):
+        """Trace through passthrough ops to find the original data tensor."""
+        visited = set()
+        while tensor_name in passthrough_map and tensor_name not in visited:
+            visited.add(tensor_name)
+            tensor_name = passthrough_map[tensor_name]
+        return tensor_name
 
     # First pass: mark relu/clip nodes that can be fused
     relu_inputs = {}   # input_tensor → output_tensor (for Relu)
@@ -464,8 +483,9 @@ def fuse_graph(nodes, weights):
     for node in nodes:
         if node.op_type in ('Relu', 'Clip'):
             continue  # handled by fusion
-        if node.op_type in ('Constant', 'Reshape', 'BatchNormalization'):
-            continue  # skip utility ops (BN should already be folded)
+        if node.op_type in ('Constant', 'Reshape', 'Flatten', 'Squeeze',
+                            'Unsqueeze', 'BatchNormalization'):
+            continue  # skip shape-only / utility ops (BN should already be folded)
 
         if node.op_type == 'Conv':
             group = node.attrs.get('group', 1)
@@ -503,7 +523,18 @@ def fuse_graph(nodes, weights):
             }
             fused.append(op)
 
-    return fused
+        elif node.op_type in ('Gemm', 'MatMul'):
+            out_tensor = node.outputs[0]
+            op = {
+                'type': 'fc',
+                'node': node,
+                'relu': out_tensor in relu_inputs,
+                'relu6': out_tensor in relu6_inputs,
+                'relu_output': relu_inputs.get(out_tensor) or relu6_inputs.get(out_tensor),
+            }
+            fused.append(op)
+
+    return fused, passthrough_map
 
 
 # ─── Main Conversion ───
@@ -529,8 +560,19 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     # 3. Fuse graph
     print("\n=== Fusing graph ===")
-    fused_ops = fuse_graph(nodes, all_weights)
+    fused_ops, passthrough_map = fuse_graph(nodes, all_weights)
+
+    # Helper: resolve passthrough tensors (Reshape/Flatten/Squeeze don't change data)
+    def resolve_passthrough(tensor_name):
+        visited = set()
+        while tensor_name in passthrough_map and tensor_name not in visited:
+            visited.add(tensor_name)
+            tensor_name = passthrough_map[tensor_name]
+        return tensor_name
+
     print(f"  Fused ops: {len(fused_ops)}")
+    if passthrough_map:
+        print(f"  Passthrough (shape-only) ops: {len(passthrough_map)}")
     for i, op in enumerate(fused_ops):
         act_str = '+ReLU6' if op.get('relu6') else ('+ReLU' if op['relu'] else '')
         if op['type'] in ('conv', 'dw'):
@@ -540,6 +582,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         elif op['type'] == 'pool':
             n = op['node']
             print(f"    [{i:2d}] POOL {n.op_type} {n.input_shape} → {n.output_shape} {act_str}")
+        elif op['type'] == 'fc':
+            n = op['node']
+            print(f"    [{i:2d}] FC   {n.op_type} {n.input_shape} → {n.output_shape} {act_str}")
         else:
             n = op['node']
             print(f"    [{i:2d}] ADD  {n.input_shape} {act_str}")
@@ -557,6 +602,17 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     # Map: tensor_name → fused layer index (for residual tracking)
     tensor_to_layer_idx = {}
 
+    def get_tensor_quant(tensor_name):
+        """Look up quantization params, resolving passthrough ops."""
+        if tensor_name in tensor_quant:
+            return tensor_quant[tensor_name]
+        resolved = resolve_passthrough(tensor_name)
+        if resolved in tensor_quant:
+            # Cache for future lookups
+            tensor_quant[tensor_name] = tensor_quant[resolved]
+            return tensor_quant[tensor_name]
+        return None
+
     # Helper: get calibrated range
     def get_range(tensor_name, is_relu_output=False):
         """Get calibration range.
@@ -569,16 +625,18 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         the range costs very little precision, but clipping hurts significantly
         because the clipping error dominates the tiny quantization noise).
         """
+        # Resolve passthrough (Reshape/Flatten output → original data tensor)
+        resolved = resolve_passthrough(tensor_name)
         if bits >= 16:
             # INT16: use full min/max range to avoid clipping
-            r = act_ranges.get(tensor_name)
+            r = act_ranges.get(resolved) or act_ranges.get(tensor_name)
             if r is None:
-                r = act_percentiles.get(tensor_name, (-1.0, 1.0))
+                r = act_percentiles.get(resolved) or act_percentiles.get(tensor_name, (-1.0, 1.0))
         else:
             # INT8: use percentile for robustness
-            r = act_percentiles.get(tensor_name)
+            r = act_percentiles.get(resolved) or act_percentiles.get(tensor_name)
             if r is None:
-                r = act_ranges.get(tensor_name, (-1.0, 1.0))
+                r = act_ranges.get(resolved) or act_ranges.get(tensor_name, (-1.0, 1.0))
         vmin, vmax = r
         if is_relu_output:
             vmin = 0.0  # ReLU outputs are non-negative
@@ -602,7 +660,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         if op['type'] in ('conv', 'dw'):
             # Get input scale
             input_tensor = node.inputs[0]
-            if input_tensor not in tensor_quant:
+            if get_tensor_quant(input_tensor) is None:
                 r = get_range(input_tensor)
                 s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
                 tensor_quant[input_tensor] = (s, z)
@@ -693,10 +751,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             input_b_name = node.inputs[1]
 
             # Get scales for both inputs
-            if input_a_name not in tensor_quant:
+            if get_tensor_quant(input_a_name) is None:
                 r = get_range(input_a_name)
                 tensor_quant[input_a_name] = compute_scale_zp_symmetric(r[0], r[1], bits)
-            if input_b_name not in tensor_quant:
+            if get_tensor_quant(input_b_name) is None:
                 r = get_range(input_b_name)
                 tensor_quant[input_b_name] = compute_scale_zp_symmetric(r[0], r[1], bits)
 
@@ -761,8 +819,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             prev_output_tensors = set()
             # Identify which input comes from the immediately previous layer (= "current")
             # and which comes from an earlier skip layer (= "residual_src")
-            idx_a = tensor_to_layer_idx.get(input_a_name, -1)
-            idx_b = tensor_to_layer_idx.get(input_b_name, -1)
+            idx_a = tensor_to_layer_idx.get(input_a_name,
+                    tensor_to_layer_idx.get(resolve_passthrough(input_a_name), -1))
+            idx_b = tensor_to_layer_idx.get(input_b_name,
+                    tensor_to_layer_idx.get(resolve_passthrough(input_b_name), -1))
 
             if idx_a == prev_layer_idx:
                 # input_a is current, input_b is residual
@@ -790,7 +850,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         elif op['type'] == 'pool':
             # Pooling: no weight, passthrough quantization
             input_tensor = node.inputs[0]
-            if input_tensor not in tensor_quant:
+            if get_tensor_quant(input_tensor) is None:
                 r = get_range(input_tensor)
                 s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
                 tensor_quant[input_tensor] = (s, z)
@@ -855,6 +915,141 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
             tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
             # No weight blob for pooling
+
+        elif op['type'] == 'fc':
+            # Fully-connected: Gemm or MatMul with constant weight
+            # Gemm: Y = alpha * A * B + beta * C (typical: alpha=1, beta=1, transB=1)
+            # Input may come through Flatten/Reshape — resolve passthrough
+            input_tensor = node.inputs[0]
+            if get_tensor_quant(input_tensor) is None:
+                r = get_range(input_tensor)
+                s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
+                tensor_quant[input_tensor] = (s, z)
+            scale_in, zp_in = tensor_quant[input_tensor]
+
+            # Get weight matrix
+            weight_name = node.inputs[1]
+            weight = all_weights.get(weight_name)
+            if weight is None:
+                print(f"  WARNING: FC weight '{weight_name}' not found, skipping")
+                continue
+
+            # Handle Gemm transB attribute
+            # ONNX Gemm: Y = alpha * A * B' + beta * C
+            #   transB=1: B' = B^T, so B stored as [out_c, in_c] (already correct)
+            #   transB=0: B stored as [in_c, out_c], need transpose to [out_c, in_c]
+            transB = node.attrs.get('transB', 0) if node.op_type == 'Gemm' else 0
+            if not transB:
+                # transB=0: weight is [in_c, out_c], transpose to [out_c, in_c]
+                weight = weight.T.copy()
+            # After this: weight shape = [out_c, in_c]
+
+            # For MatMul: A=[1, in_c] * B=[in_c, out_c] → [1, out_c]
+            # Weight B needs transpose to become [out_c, in_c]
+            if node.op_type == 'MatMul' and weight.ndim == 2:
+                # MatMul: A * B, B is [in_c, out_c]
+                # Need [out_c, in_c] for our format
+                in_features = node.input_shape[-1] if node.input_shape else weight.shape[0]
+                if weight.shape[0] == in_features:
+                    weight = weight.T.copy()
+
+            out_c, in_c = weight.shape[0], weight.shape[1]
+
+            # Reorder FC weight columns from NCHW to NHWC layout
+            # csim stores activation tensors in NHWC order, but ONNX Flatten produces
+            # NCHW order. We need to permute the weight's input dimension accordingly.
+            # Only needed when FC input comes from a spatial tensor (H>1 or W>1).
+            fc_input_tensor = resolve_passthrough(node.inputs[0])
+            # Find the 4D shape of the tensor before flatten/reshape
+            fc_in_4d = None
+            for n in nodes:
+                if n.outputs and n.outputs[0] == fc_input_tensor and n.output_shape:
+                    fc_in_4d = n.output_shape
+                    break
+            if fc_in_4d is None:
+                # Try node.input_shape (for Gemm directly on graph input)
+                fc_in_4d = node.input_shape
+
+            if fc_in_4d is not None and len(fc_in_4d) == 4:
+                _, fc_c, fc_h, fc_w = fc_in_4d
+                if fc_h > 1 or fc_w > 1:
+                    # Need to reorder: NCHW flatten order → NHWC flatten order
+                    # NCHW index: c*H*W + h*W + w
+                    # NHWC index: h*W*C + w*C + c
+                    assert in_c == fc_c * fc_h * fc_w, \
+                        f"FC in_c={in_c} != {fc_c}*{fc_h}*{fc_w}={fc_c*fc_h*fc_w}"
+                    # Build permutation: for each NHWC position, find NCHW source
+                    perm = np.zeros(in_c, dtype=np.int32)
+                    for c in range(fc_c):
+                        for h in range(fc_h):
+                            for w in range(fc_w):
+                                nchw_idx = c * fc_h * fc_w + h * fc_w + w
+                                nhwc_idx = h * fc_w * fc_c + w * fc_c + c
+                                perm[nhwc_idx] = nchw_idx
+                    weight = weight[:, perm]
+
+            # Get bias (Gemm input[2] or None)
+            bias = None
+            if len(node.inputs) > 2 and node.inputs[2] in all_weights:
+                bias = all_weights[node.inputs[2]]
+
+            # Quantize weight per-channel
+            weight_q, scale_w = quantize_weight_perchannel(
+                weight.reshape(out_c, 1, 1, in_c), out_axis=0, bits=bits)
+            weight_q = weight_q.reshape(out_c, in_c)
+
+            # Output scale
+            out_range = get_range(eff_output, is_relu_output=has_act)
+            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
+            tensor_quant[eff_output] = (scale_out, zp_out)
+
+            # Compute requantize params
+            M_arr, S_arr, bias_q_arr = compute_requant_params(
+                scale_in, scale_w, scale_out, bias)
+
+            # Build LayerConfig for FC
+            # csim FC expects: in_h=1, in_w=1, in_c=features, out_h=1, out_w=1, out_c=outputs
+            cfg = LayerConfig(
+                op_type=OP_FC,
+                data_type=1 if bits == 16 else 0,
+                in_h=1, in_w=1, in_c=in_c,
+                out_h=1, out_w=1, out_c=out_c,
+                post_ctrl=POST_BIAS_EN | PPU_MODE_CONV_REQ,
+                clamp_min=qmin, clamp_max=qmax,
+                in_zp=int(zp_in),
+            )
+            if bits == 16:
+                cfg.post_ctrl |= POST_INT16_OUT
+            if op.get('relu6'):
+                cfg.post_ctrl |= POST_RELU6_EN
+                relu6_qmax = int(np.round(6.0 / scale_out))
+                cfg.clamp_max = min(qmax, relu6_qmax)
+            elif op['relu']:
+                cfg.post_ctrl |= POST_RELU_EN
+            if zp_out != 0:
+                cfg.post_ctrl |= POST_ZP_EN
+
+            # Per-channel params
+            ch_params = []
+            for c in range(out_c):
+                ch_params.append(PerChannelParam(
+                    M=int(M_arr[c]),
+                    S=int(S_arr[c]),
+                    zp=int(zp_out),
+                    bias_q=int(bias_q_arr[c]),
+                ))
+            cfg.ch_params = ch_params
+
+            npu_layers.append(cfg)
+            tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
+            tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
+
+            # Weight blob: FC weight layout for csim is [out_c][in_c] (row-major)
+            weight_blobs.append(weight_q.tobytes())
+
+            print(f"    FC[{len(npu_layers)-1}]: {node.op_type} "
+                  f"{in_c} → {out_c}"
+                  f"{' +ReLU6' if op.get('relu6') else ' +ReLU' if op['relu'] else ''}")
 
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")
