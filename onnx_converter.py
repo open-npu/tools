@@ -34,15 +34,28 @@ from model_packer import (
 
 # ─── Utility ───
 
-def preprocess_image_from_file(path, input_shape):
-    """Load and preprocess calibration image (resize to HxW, normalize to float32)."""
+def preprocess_image_from_file(path, input_shape, mean=None, std=None):
+    """Load and preprocess calibration image (resize to HxW, normalize to float32).
+
+    If mean/std are provided, applies ImageNet-style normalization:
+        arr = (pixel/255 - mean) / std
+    Otherwise falls back to default:
+        arr = (pixel - 127.5) / 255  → range [-0.5, 0.5]
+    """
     _, c, h, w = input_shape
     img = Image.open(path).convert('RGB')
     img = img.resize((w, h), Image.BILINEAR)
     arr = np.array(img, dtype=np.float32)  # [H,W,3]
     arr = arr.transpose(2, 0, 1)  # [3,H,W]
-    # Normalize: (pixel - 127.5) / 255  → range ~ [-0.5, 0.5]
-    arr = (arr - 127.5) / 255.0
+    if mean is not None and std is not None:
+        # ImageNet-style: normalize to (pixel/255 - mean) / std
+        mean_arr = np.array(mean, dtype=np.float32).reshape(c, 1, 1)
+        std_arr = np.array(std, dtype=np.float32).reshape(c, 1, 1)
+        arr = arr / 255.0
+        arr = (arr - mean_arr) / std_arr
+    else:
+        # Default: (pixel - 127.5) / 255 → range [-0.5, 0.5]
+        arr = (arr - 127.5) / 255.0
     return arr[np.newaxis, ...]  # [1,C,H,W]
 
 
@@ -121,8 +134,12 @@ def parse_onnx_graph(model_path):
 
 # ─── Calibration: collect activation ranges ───
 
-def calibrate_model(model_path, calib_dir, input_shape, num_images=50):
+def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None, std=None):
     """Run calibration images through ONNX Runtime to collect per-tensor activation ranges.
+
+    Args:
+        mean, std: If provided, use ImageNet-style normalization for calibration.
+                   This ensures activation ranges are measured with correct input distribution.
 
     Returns:
         activation_ranges: dict { tensor_name: (min, max) }
@@ -170,7 +187,7 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50):
     PERCENTILE_HIGH = 99.9  # 99.9th percentile
 
     for i, img_path in enumerate(image_files):
-        inp = preprocess_image_from_file(img_path, input_shape)
+        inp = preprocess_image_from_file(img_path, input_shape, mean=mean, std=std)
         outputs = sess.run(None, {input_name: inp})
         output_names = [o.name for o in sess.get_outputs()]
 
@@ -192,9 +209,22 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50):
         if (i + 1) % 10 == 0:
             print(f"  Calibrated {i+1}/{len(image_files)} images")
 
-    # Add input range (fixed for our normalization: [-0.5, 0.5])
-    ranges[input_name] = (-0.5, 0.5)
-    percentile_data[input_name] = (-0.5, 0.5)
+    # Add input range
+    if mean is not None and std is not None:
+        # Compute input range from mean/std normalization: x = (pixel/255 - mean) / std
+        # pixel ∈ [0, 255] → pixel/255 ∈ [0, 1]
+        mean_arr = np.array(mean, dtype=np.float32)
+        std_arr = np.array(std, dtype=np.float32)
+        ch_mins = (0.0 - mean_arr) / std_arr
+        ch_maxs = (1.0 - mean_arr) / std_arr
+        in_min = float(ch_mins.min())
+        in_max = float(ch_maxs.max())
+        ranges[input_name] = (in_min, in_max)
+        percentile_data[input_name] = (in_min, in_max)
+    else:
+        # Default normalization: (pixel - 127.5) / 255 → [-0.5, 0.5]
+        ranges[input_name] = (-0.5, 0.5)
+        percentile_data[input_name] = (-0.5, 0.5)
 
     print(f"  Collected ranges for {len(ranges)} tensors")
 
@@ -412,6 +442,79 @@ def fold_batchnorm(nodes, weights):
     return filtered
 
 
+def fold_mean_std(nodes, weights, graph_input_name, mean, std):
+    """Fold input mean/std normalization into the first Conv layer.
+
+    After folding, the model produces correct output when fed x_current = (pixel-127.5)/255
+    instead of requiring x_norm = (pixel/255 - mean) / std.
+
+    Math:
+        x_norm[c] = (x_current[c] + 0.5 - mean[c]) / std[c]
+                   = x_current[c] / std[c] + offset[c]
+        where offset[c] = (0.5 - mean[c]) / std[c]
+
+        W_new[oc, c, :, :] = W[oc, c, :, :] / std[c]
+        b_new[oc] = b[oc] + sum_c(sum_hw(W[oc, c, :, :]) * offset[c])
+
+    Modifies weights dict in-place.
+    """
+    mean = np.array(mean, dtype=np.float32)
+    std = np.array(std, dtype=np.float32)
+
+    # Find first Conv node that takes graph input
+    first_conv = None
+    for node in nodes:
+        if node.op_type == 'Conv' and node.inputs[0] == graph_input_name:
+            first_conv = node
+            break
+
+    if first_conv is None:
+        print("  WARNING: No Conv node directly consuming graph input — skipping fold")
+        return nodes
+
+    # Get weight
+    weight_name = first_conv.inputs[1]
+    W = weights[weight_name]  # [OC, IC, KH, KW]
+    OC, IC = W.shape[0], W.shape[1]
+
+    # Compute per-channel scale and offset
+    scale_c = 1.0 / std  # [IC]
+    offset_c = (0.5 - mean) / std  # [IC]
+
+    # Transform weight: W_new[oc, c, :, :] = W[oc, c, :, :] / std[c]
+    W_new = W * scale_c.reshape(1, IC, 1, 1)
+
+    # Transform bias: b_new[oc] = b[oc] + sum_c(sum_hw(W[oc,c,:,:]) * offset[c])
+    # sum_hw(W[oc,c,:,:]) has shape [OC, IC]
+    W_sum_hw = W.sum(axis=(2, 3))  # [OC, IC]
+    bias_correction = (W_sum_hw * offset_c.reshape(1, IC)).sum(axis=1)  # [OC]
+
+    # Get or create bias
+    if len(first_conv.inputs) > 2 and first_conv.inputs[2] in weights:
+        bias_name = first_conv.inputs[2]
+        b = weights[bias_name]
+    else:
+        b = np.zeros(OC, dtype=np.float32)
+        bias_name = weight_name + '_mean_std_bias'
+        if len(first_conv.inputs) <= 2:
+            first_conv.inputs.append(bias_name)
+        else:
+            first_conv.inputs[2] = bias_name
+
+    b_new = b + bias_correction
+
+    # Update weights dict and node
+    weights[weight_name] = W_new
+    weights[bias_name] = b_new
+    first_conv.weight = W_new
+    first_conv.bias = b_new
+
+    print(f"  Folded mean={mean.tolist()} std={std.tolist()} into first Conv ({weight_name})")
+    print(f"    Weight scale range: [{scale_c.min():.4f}, {scale_c.max():.4f}]")
+    print(f"    Bias correction range: [{bias_correction.min():.6f}, {bias_correction.max():.6f}]")
+    return nodes
+
+
 def fuse_graph(nodes, weights):
     """Fuse Relu/Clip into preceding Conv/Add nodes, skip shape-only ops.
 
@@ -514,7 +617,7 @@ def fuse_graph(nodes, weights):
             }
             fused.append(op)
 
-        elif node.op_type in ('MaxPool', 'AveragePool', 'GlobalAveragePool'):
+        elif node.op_type in ('MaxPool', 'AveragePool', 'GlobalAveragePool', 'ReduceMean'):
             out_tensor = node.outputs[0]
             op = {
                 'type': 'pool',
@@ -564,8 +667,15 @@ def fuse_graph(nodes, weights):
 # ─── Main Conversion ───
 
 def convert_model(model_path, calib_dir, input_path, output_path,
-                  input_format='int8-nchw', num_calib=50, bits=8):
-    """Full conversion pipeline: ONNX float32 → NPU1 quantized."""
+                  input_format='int8-nchw', num_calib=50, bits=8,
+                  mean=None, std=None):
+    """Full conversion pipeline: ONNX float32 → NPU1 quantized.
+
+    Args:
+        mean, std: Per-channel normalization params (list of 3 floats).
+                   If provided, the normalization (pixel/255 - mean)/std is folded
+                   into the first Conv layer weights. Default: no fold (uses [-0.5, 0.5]).
+    """
 
     # 1. Parse graph
     print(f"=== Parsing ONNX model (INT{bits} mode) ===")
@@ -574,13 +684,23 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     print(f"  Output: {output_name}")
     print(f"  Nodes: {len(nodes)}")
 
-    # 2. Calibrate
+    # 2. Calibrate (with correct mean/std preprocessing to get accurate activation ranges)
     print("\n=== Running PTQ Calibration ===")
-    act_ranges, act_percentiles = calibrate_model(model_path, calib_dir, input_shape, num_calib)
+    act_ranges, act_percentiles = calibrate_model(model_path, calib_dir, input_shape, num_calib,
+                                                  mean=mean, std=std)
 
     # 2.5. Fold BatchNorm into Conv (graph optimization, float32 level)
     print("\n=== Folding BatchNorm ===")
     nodes = fold_batchnorm(nodes, all_weights)
+
+    # 2.6. Fold input mean/std normalization into first Conv
+    if mean is not None and std is not None:
+        print("\n=== Folding input normalization (mean/std) ===")
+        nodes = fold_mean_std(nodes, all_weights, input_name, mean, std)
+        # After fold, model expects x_current = (pixel-127.5)/255 ∈ [-0.5, 0.5]
+        # Override input range to match post-fold expectation
+        act_ranges[input_name] = (-0.5, 0.5)
+        act_percentiles[input_name] = (-0.5, 0.5)
 
     # 3. Fuse graph
     print("\n=== Fusing graph ===")
@@ -601,7 +721,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         act_str = '+ReLU6' if op.get('relu6') else ('+ReLU' if op['relu'] else '')
         if op['type'] in ('conv', 'dw'):
             n = op['node']
-            ks = n.attrs.get('kernel_shape', [1, 1])
+            ks = n.attrs.get('kernel_shape') or (list(n.weight.shape[2:]) if n.weight is not None else [1, 1])
             print(f"    [{i:2d}] {op['type'].upper():4s} {ks} {n.input_shape} → {n.output_shape} {act_str}")
         elif op['type'] == 'pool':
             n = op['node']
@@ -718,7 +838,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             if op['type'] == 'dw':
                 ic = weight.shape[0]
 
-            ks = node.attrs.get('kernel_shape', [1, 1])
+            ks = node.attrs.get('kernel_shape') or list(weight.shape[2:])
             strides = node.attrs.get('strides', [1, 1])
             pads = node.attrs.get('pads', [0, 0, 0, 0])
             dilations = node.attrs.get('dilations', [1, 1])
@@ -898,7 +1018,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             _, oc, oh, ow = node.output_shape if node.output_shape else [1, 1, 1, 1]
 
             # Parse pooling attributes
-            is_global = (node.op_type == 'GlobalAveragePool')
+            is_global = (node.op_type in ('GlobalAveragePool', 'ReduceMean'))
             pool_mode = 0 if node.op_type == 'MaxPool' else 1  # 0=Max, 1=Avg
 
             if is_global:
@@ -1332,7 +1452,12 @@ if __name__ == '__main__':
                         help='Number of calibration images to use')
     parser.add_argument('--bits', type=int, default=8, choices=[8, 16],
                         help='Quantization bit-width (8 or 16)')
+    parser.add_argument('--mean', type=float, nargs=3, default=None,
+                        help='Per-channel input mean (e.g. 0.485 0.456 0.406 for ImageNet)')
+    parser.add_argument('--std', type=float, nargs=3, default=None,
+                        help='Per-channel input std (e.g. 0.229 0.224 0.225 for ImageNet)')
     args = parser.parse_args()
 
     convert_model(args.model, args.calib, args.input, args.output,
-                  args.input_format, args.num_calib, args.bits)
+                  args.input_format, args.num_calib, args.bits,
+                  mean=args.mean, std=args.std)
