@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tiling import compute_tiling
 from layer_fusion import detect_fusible_blocks, compute_fused_tiling, estimate_fusion_savings
+from hw_config import HWConfig as HWProfile, DEFAULT_HW, add_hw_args, hw_config_from_args
 
 
 # ─── Hardware Configuration ───
@@ -38,6 +39,21 @@ class HWConfig:
     elem_size: int = 1            # 1=INT8, 2=INT16
     double_buffer: bool = True    # Enable ping-pong overlap
     adaptive_db: bool = False     # Adaptive: per-layer best of single/double buffer
+
+    @classmethod
+    def from_hw(cls, hw: HWProfile, elem_size: int = 1,
+                double_buffer: bool = True, adaptive_db: bool = False):
+        return cls(
+            array_size=hw.array_size,
+            macs_per_cycle=hw.macs_per_cycle,
+            act_bank_bytes=hw.act_bank_size,
+            weight_buf_bytes=hw.weight_buf_size,
+            ext_bw_bytes=hw.ext_bw_bytes,
+            dw_parallel_ch=hw.dw_parallel_ch,
+            elem_size=elem_size,
+            double_buffer=double_buffer,
+            adaptive_db=adaptive_db,
+        )
 
 
 # ─── Layer Descriptor ───
@@ -771,8 +787,6 @@ def main():
                         help='Run built-in M110 MobileNetV2 test')
     parser.add_argument('--bits', type=int, default=8, choices=[8, 16],
                         help='Data type: 8=INT8, 16=INT16 (default: 8)')
-    parser.add_argument('--bw', type=int, default=4,
-                        help='External bus bandwidth in bytes/cycle (default: 4)')
     parser.add_argument('--no-double-buffer', action='store_true',
                         help='Disable double-buffer (serial DMA+compute, full buffer)')
     parser.add_argument('--adaptive', action='store_true',
@@ -781,7 +795,10 @@ def main():
                         help='Compare single-buffer vs double-buffer vs adaptive performance')
     parser.add_argument('--fusion', action='store_true',
                         help='Enable super-layer fusion (Conv1x1→DW→Conv1x1 blocks)')
+    add_hw_args(parser)
     args = parser.parse_args()
+
+    hw_cfg = hw_config_from_args(args)
 
     if not args.resnet18_test and not args.m110_test:
         print("Usage: python3 perf_model.py --resnet18-test|--m110-test [--bits 8|16] [--bw 4] [--compare] [--fusion]")
@@ -796,9 +813,9 @@ def main():
 
     if args.fusion:
         # Fusion comparison mode
-        hw = HWConfig(
+        hw = HWConfig.from_hw(
+            hw_cfg,
             elem_size=2 if args.bits == 16 else 1,
-            ext_bw_bytes=args.bw,
             double_buffer=True,
             adaptive_db=True,
         )
@@ -871,19 +888,19 @@ def main():
               f"{'INT16' if args.bits == 16 else 'INT8'}) — Single vs Double vs Adaptive\n")
         print("=" * 110)
 
-        hw_single = HWConfig(
+        hw_single = HWConfig.from_hw(
+            hw_cfg,
             elem_size=2 if args.bits == 16 else 1,
-            ext_bw_bytes=args.bw,
             double_buffer=False,
         )
-        hw_double = HWConfig(
+        hw_double = HWConfig.from_hw(
+            hw_cfg,
             elem_size=2 if args.bits == 16 else 1,
-            ext_bw_bytes=args.bw,
             double_buffer=True,
         )
-        hw_adaptive = HWConfig(
+        hw_adaptive = HWConfig.from_hw(
+            hw_cfg,
             elem_size=2 if args.bits == 16 else 1,
-            ext_bw_bytes=args.bw,
             double_buffer=True,
             adaptive_db=True,
         )
@@ -939,9 +956,9 @@ def main():
             print(f"    Adaptive:      {t_a:>8.2f} ms ({1000/t_a:.1f} FPS)")
 
     else:
-        hw = HWConfig(
+        hw = HWConfig.from_hw(
+            hw_cfg,
             elem_size=2 if args.bits == 16 else 1,
-            ext_bw_bytes=args.bw,
             double_buffer=not args.no_double_buffer,
             adaptive_db=args.adaptive,
         )

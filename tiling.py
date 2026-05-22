@@ -2,28 +2,19 @@
 Open-NPU Tiling Calculator
 
 Computes optimal tile dimensions for each layer based on hardware SRAM constraints.
-
-Hardware resources (0.2T variant):
-  - Activation Bank A (input tile):  32 KB
-  - Activation Bank B (output tile): 32 KB
-  - Weight Buffer:                    64 KB
-  - Parameter SRAM:                    8 KB (max 512 channels/tile)
+Hardware parameters come from hw_profile.py (profile-driven).
 
 SPDX-License-Identifier: Apache-2.0
 """
 
 import math
-
-# Hardware constants (match npu_config.h)
-ACT_BANK_SIZE = 32 * 1024       # 32 KB per activation bank
-WEIGHT_BUF_SIZE = 64 * 1024     # 64 KB weight buffer
-PARAM_SRAM_MAX_CH = 512         # Parameter SRAM supports max 512 channels
+from hw_config import HWConfig, DEFAULT_HW
 
 
 def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
                    kernel_h=1, kernel_w=1, stride_h=1, stride_w=1,
                    dilation_h=1, dilation_w=1, elem_size=2,
-                   double_buffer=False):
+                   double_buffer=False, profile=None):
     """Compute optimal tile dimensions for a layer.
 
     Args:
@@ -35,14 +26,19 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         dilation_h, dilation_w: dilation
         elem_size: bytes per element (1=INT8, 2=INT16)
         double_buffer: if True, use half-buffer sizes (ping/pong mode)
+        profile: HWProfile instance (default: NPU_FULL)
 
     Returns:
         dict with keys: tile_h, tile_w, tile_num_h, tile_num_w, tile_oc
               (tile_h/w = 0 and tile_num_h/w = 0 means no tiling needed)
     """
+    if profile is None:
+        profile = DEFAULT_HW
+
     # Effective buffer sizes (halved in double-buffer mode)
-    act_bank = ACT_BANK_SIZE // 2 if double_buffer else ACT_BANK_SIZE
-    weight_buf = WEIGHT_BUF_SIZE // 2 if double_buffer else WEIGHT_BUF_SIZE
+    act_bank = profile.act_bank_size // 2 if double_buffer else profile.act_bank_size
+    weight_buf = profile.weight_buf_size // 2 if double_buffer else profile.weight_buf_size
+    param_max_ch = profile.param_sram_max_ch
 
     # FC and Concat don't do spatial tiling
     if op_type in ('fc', 'concat'):
@@ -57,7 +53,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         weight_per_oc = kernel_h * kernel_w * in_c * elem_size
         if weight_per_oc > 0:
             tile_oc = min(out_c, weight_buf // weight_per_oc)
-            tile_oc = min(tile_oc, PARAM_SRAM_MAX_CH)
+            tile_oc = min(tile_oc, param_max_ch)
             tile_oc = max(tile_oc, 1)
         else:
             tile_oc = out_c
@@ -247,8 +243,8 @@ if __name__ == '__main__':
 
     # Constraint verification for double-buffer mode
     print("\n\n=== Constraint Verification (Double-Buffer Mode) ===")
-    act_bank = ACT_BANK_SIZE // 2
-    weight_buf = WEIGHT_BUF_SIZE // 2
+    act_bank = DEFAULT_HW.act_bank_size // 2
+    weight_buf = DEFAULT_HW.weight_buf_size // 2
     print(f"  Effective act_bank = {act_bank // 1024}KB, weight_buf = {weight_buf // 1024}KB\n")
 
     layers_info_db = []
