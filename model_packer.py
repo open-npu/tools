@@ -10,7 +10,7 @@ Binary format "NPU1":
     uint32 weight_offset
     uint32 weight_size
   Layer descriptors (variable-length, concatenated):
-    fixed_config (60 bytes) + per-channel params + [add params] + [LUT]
+    fixed_config (62 bytes) + per-channel params + [add params] + [LUT]
   Weight blob (at weight_offset)
 
 SPDX-License-Identifier: Apache-2.0
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
 MODEL_MAGIC = 0x4E505531  # "NPU1"
-FIXED_CONFIG_SIZE = 60
+FIXED_CONFIG_SIZE = 62
 
 # Operator types
 OP_CONV2D = 0
@@ -47,6 +47,12 @@ POST_LUT_EN = (1 << 4)
 POST_ZP_EN = (1 << 5)
 POST_BIAS_EN = (1 << 6)
 POST_INT16_OUT = (1 << 7)
+
+# SCHED_CTRL bits (model descriptor scheduling, NOT HW DMA_CTRL CSR)
+SCHED_CTRL_DB_EN      = (1 << 0)   # bit[0]: double-buffer enable
+SCHED_CTRL_FUSE_START = (1 << 1)   # bit[1]: first layer of fused block
+SCHED_CTRL_FUSE_MID   = (1 << 2)   # bit[2]: middle layer of fused block
+SCHED_CTRL_FUSE_END   = (1 << 3)   # bit[3]: last layer of fused block
 
 
 @dataclass
@@ -128,6 +134,7 @@ class LayerConfig:
     tile_num_h: int = 0
     tile_num_w: int = 0
     post_ctrl: int = 0
+    sched_ctrl: int = 0           # bit[0]: DB_EN (double-buffer enable)
     clamp_min: int = -128
     clamp_max: int = 127
     in_zp: int = 0
@@ -138,13 +145,15 @@ class LayerConfig:
     add_params: Optional[AddParam] = None
     # Residual source layer index (-1 = none)
     residual_src: int = -1
+    # Input source layer index (-1 = previous layer)
+    input_src: int = -1
     # LUT data
     lut_i8: bytes = field(default_factory=lambda: bytes(256))
     lut_i16: bytes = field(default_factory=lambda: bytes(512))
     has_lut: bool = False
 
     def pack_fixed(self) -> bytes:
-        """Pack the 60-byte fixed config portion."""
+        """Pack the 62-byte fixed config portion."""
         buf = bytearray(FIXED_CONFIG_SIZE)
         off = 0
 
@@ -190,7 +199,7 @@ class LayerConfig:
         w16(self.tile_num_h)   # 43
         w16(self.tile_num_w)   # 45
         w8(self.post_ctrl)     # 47
-        w8s(0)                 # 48: _pad0
+        w8(self.sched_ctrl)    # 48: sched_ctrl (bit0=DB_EN)
         w16s(self.clamp_min)   # 49
         w16s(self.clamp_max)   # 51
         w8s(self.in_zp)        # 53
@@ -199,6 +208,7 @@ class LayerConfig:
         w8(1 if self.has_lut else 0)  # 57: has_lut
         w8(1 if self.add_params else 0)  # 58: has_add
         w8s(self.residual_src)  # 59: residual_src (-1=none)
+        w16s(self.input_src)    # 60: input_src (-1=previous layer)
 
         assert off == FIXED_CONFIG_SIZE, f"Expected {FIXED_CONFIG_SIZE}, got {off}"
         return bytes(buf)
