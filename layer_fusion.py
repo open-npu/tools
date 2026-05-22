@@ -19,11 +19,7 @@ SPDX-License-Identifier: Apache-2.0
 import math
 from dataclasses import dataclass
 from typing import List, Optional
-
-# Hardware constants (match tiling.py)
-ACT_BANK_SIZE = 32 * 1024       # 32 KB per activation bank
-WEIGHT_BUF_SIZE = 64 * 1024     # 64 KB weight buffer
-PARAM_SRAM_MAX_CH = 512
+from hw_config import HWConfig, DEFAULT_HW
 
 
 @dataclass
@@ -154,7 +150,8 @@ def detect_fusible_blocks(layers) -> List[FusedBlock]:
     return blocks
 
 
-def compute_fused_tiling(block: FusedBlock, elem_size: int = 1) -> FusedTiling:
+def compute_fused_tiling(block: FusedBlock, elem_size: int = 1,
+                         profile: HWConfig = None) -> FusedTiling:
     """Compute optimal tile size for fused block execution.
 
     SRAM constraint model (2-bank alternating):
@@ -181,13 +178,19 @@ def compute_fused_tiling(block: FusedBlock, elem_size: int = 1) -> FusedTiling:
     out_h = block.out_h
     out_w = block.out_w
 
+    if profile is None:
+        profile = DEFAULT_HW
+    act_bank_size = profile.act_bank_size
+    weight_buf_size = profile.weight_buf_size
+    param_sram_max_ch = profile.param_sram_max_ch
+
     def _fits(th, tw):
         """Check if tile th×tw fits in SRAM banks."""
         ih = th + halo
         iw = tw + halo
         bank_a = max(ih * iw * c_in, th * tw * c_mid) * elem_size
         bank_b = max(ih * iw * c_mid, th * tw * c_out) * elem_size
-        return bank_a <= ACT_BANK_SIZE and bank_b <= ACT_BANK_SIZE
+        return bank_a <= act_bank_size and bank_b <= act_bank_size
 
     # Find largest square tile that fits
     best_t = 0
@@ -228,14 +231,14 @@ def compute_fused_tiling(block: FusedBlock, elem_size: int = 1) -> FusedTiling:
 
     # OC tiling for Conv1×1 #1 (weight = c_in × tile_oc1 bytes)
     weight_per_oc1 = c_in * elem_size  # 1×1 conv: weight_per_oc = in_c
-    oc1_tile = min(c_mid, WEIGHT_BUF_SIZE // weight_per_oc1)
-    oc1_tile = min(oc1_tile, PARAM_SRAM_MAX_CH)
+    oc1_tile = min(c_mid, weight_buf_size // weight_per_oc1)
+    oc1_tile = min(oc1_tile, param_sram_max_ch)
     oc1_groups = math.ceil(c_mid / oc1_tile)
 
     # OC tiling for Conv1×1 #2 (weight = c_mid × tile_oc2 bytes)
     weight_per_oc2 = c_mid * elem_size
-    oc2_tile = min(c_out, WEIGHT_BUF_SIZE // weight_per_oc2)
-    oc2_tile = min(oc2_tile, PARAM_SRAM_MAX_CH)
+    oc2_tile = min(c_out, weight_buf_size // weight_per_oc2)
+    oc2_tile = min(oc2_tile, param_sram_max_ch)
     oc2_groups = math.ceil(c_out / oc2_tile)
 
     # Spatial tile count (H and W independently)
