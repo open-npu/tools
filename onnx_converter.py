@@ -35,6 +35,7 @@ from model_packer import (
 )
 from tiling import compute_tiling
 from layer_fusion import detect_fusible_blocks, compute_fused_tiling
+from hw_config import DEFAULT_HW, add_hw_args, hw_config_from_args
 
 
 # ─── Utility ───
@@ -689,14 +690,17 @@ def fuse_graph(nodes, weights):
 
 def convert_model(model_path, calib_dir, input_path, output_path,
                   input_format='int8-nchw', num_calib=50, bits=8,
-                  mean=None, std=None):
+                  mean=None, std=None, profile=None):
     """Full conversion pipeline: ONNX float32 → NPU1 quantized.
 
     Args:
         mean, std: Per-channel normalization params (list of 3 floats).
                    If provided, the normalization (pixel/255 - mean)/std is folded
                    into the first Conv layer weights. Default: no fold (uses [-0.5, 0.5]).
+        profile: HWConfig instance for tiling/fusion constraints.
     """
+    if profile is None:
+        profile = DEFAULT_HW
 
     # 1. Parse graph
     print(f"=== Parsing ONNX model (INT{bits} mode) ===")
@@ -1448,6 +1452,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
             elem_size=elem_size,
             double_buffer=False,
+            profile=profile,
         )
         tile_db = compute_tiling(
             op_type=op_name,
@@ -1458,6 +1463,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
             elem_size=elem_size,
             double_buffer=True,
+            profile=profile,
         )
         # Use double-buffer tiling by default (enables overlap);
         # fall back to single-buffer if DB causes excessive tile fragmentation
@@ -1508,7 +1514,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     fused_count = 0
     for block in fused_blocks:
         # Check feasibility: compute fused tiling within SRAM constraints
-        tiling = compute_fused_tiling(block, elem_size)
+        tiling = compute_fused_tiling(block, elem_size, profile=profile)
         if not tiling.feasible:
             continue
         # Mark layers with fusion bits (preserve existing sched_ctrl bits)
@@ -1609,8 +1615,16 @@ if __name__ == '__main__':
                         help='Per-channel input mean (e.g. 0.485 0.456 0.406 for ImageNet)')
     parser.add_argument('--std', type=float, nargs=3, default=None,
                         help='Per-channel input std (e.g. 0.229 0.224 0.225 for ImageNet)')
+    add_hw_args(parser)
     args = parser.parse_args()
 
+    hw_cfg = hw_config_from_args(args)
+    # Check INT16 support
+    bits = args.bits
+    if not hw_cfg.has_int16 and bits == 16:
+        print(f"WARNING: Current HW config doesn't support INT16, falling back to INT8")
+        bits = 8
+
     convert_model(args.model, args.calib, args.input, args.output,
-                  args.input_format, args.num_calib, args.bits,
-                  mean=args.mean, std=args.std)
+                  args.input_format, args.num_calib, bits,
+                  mean=args.mean, std=args.std, profile=hw_cfg)
