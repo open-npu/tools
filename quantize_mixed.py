@@ -56,7 +56,9 @@ def collect_activation_ranges(model_path, images):
                             break
 
     import tempfile
-    tmp_path = tempfile.mktemp(suffix='.onnx')
+    tmp_fd = tempfile.NamedTemporaryFile(suffix='.onnx', prefix='npu_qmix_', delete=False)
+    tmp_path = tmp_fd.name
+    tmp_fd.close()
     onnx.save(model, tmp_path)
 
     sess = ort.InferenceSession(tmp_path)
@@ -288,8 +290,8 @@ def main():
     max_abs = collect_activation_ranges(MODEL_PATH, images)
 
     # Load test input
-    data = np.fromfile(INPUT_PATH, dtype=np.uint8).reshape(1, 224, 224, 3)
-    input_nchw = data.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+    data = np.fromfile(INPUT_PATH, dtype=np.uint8).reshape(1, 3, 224, 224)
+    input_nchw = (data.astype(np.float32) - 127.5) / 255.0
 
     # FP32 reference
     print("\nRunning FP32 reference...")

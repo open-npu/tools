@@ -227,17 +227,15 @@ def test_e2e_all():
     results = []
 
     # Test 1: Two-branch concat (output is the concat itself)
-    # Note: lower threshold because concat passthrough means different channels have
-    # different effective scales — dequantizing with a single scale introduces error.
-    # In practice, concat is rarely the final layer.
+    # With per-branch requantize, all branches are rescaled to unified output scale.
     model1 = make_two_branch_concat_model()
     results.append(('Two-branch Concat', run_e2e_test(
-        'Two-branch Concat', model1, h=8, w=8, threshold=0.70)))
+        'Two-branch Concat', model1, h=8, w=8, threshold=0.80)))
 
     # Test 2: Concat in middle of network (concat feeds into downstream Conv)
     model2 = make_concat_conv_model()
     results.append(('Concat+Conv', run_e2e_test(
-        'Concat+Conv', model2, h=8, w=8)))
+        'Concat+Conv', model2, h=8, w=8, threshold=0.90)))
 
     # Summary
     print(f"\n{'='*60}")

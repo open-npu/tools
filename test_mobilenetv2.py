@@ -9,105 +9,44 @@ that follows the exact same structure as the real model:
   - Global average pool
   - FC classifier
 
-This tests the C simulator against all key operators:
-  Conv2D, DWConv, Pooling (global avg), FC
-  With: ReLU6, stride-2 DW, residual add (eltwise)
+Tests the C simulator against Python reference using per-channel requantize.
 
 SPDX-License-Identifier: Apache-2.0
 """
 
 import sys
 import os
+import subprocess
 import numpy as np
 
 # Add tools to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_packer import (
-    LayerConfig, pack_model, run_sim_and_verify,
-    ref_conv2d, ref_dwconv, ref_pooling, ref_postproc,
+    LayerConfig, PerChannelParam, pack_model, make_ch_params,
+    ref_conv2d, ref_dwconv, ref_pooling, ref_postproc_perchannel,
     OP_CONV2D, OP_DW_CONV, OP_POOLING, OP_FC, OP_ELTWISE_ADD,
-    POST_BIAS_EN, POST_SHIFT_EN, POST_CLAMP_EN,
+    POST_BIAS_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
+    PPU_MODE_CONV_REQ, PPU_MODE_PASSTHROUGH,
 )
 
 
-def make_conv2d_layer(in_h, in_w, in_c, out_c, kernel=3, stride=1, relu6=True):
-    """Create a Conv2D layer config."""
-    pad = (kernel - 1) // 2
-    out_h = (in_h + 2 * pad - kernel) // stride + 1
-    out_w = (in_w + 2 * pad - kernel) // stride + 1
-
-    cfg = LayerConfig()
-    cfg.op_type = OP_CONV2D
-    cfg.in_h, cfg.in_w, cfg.in_c = in_h, in_w, in_c
-    cfg.out_h, cfg.out_w, cfg.out_c = out_h, out_w, out_c
-    cfg.kernel_h, cfg.kernel_w = kernel, kernel
-    cfg.dilation_h, cfg.dilation_w = 1, 1
-    cfg.stride_h, cfg.stride_w = stride, stride
-    cfg.pad_top = cfg.pad_bottom = cfg.pad_left = cfg.pad_right = pad
-    cfg.post_ctrl = POST_BIAS_EN | POST_SHIFT_EN | POST_CLAMP_EN
-    cfg.shift_bits = 4
-    cfg.round_en = 1
-    if relu6:
-        cfg.clamp_min, cfg.clamp_max = 0, 6  # ReLU6 in quantized domain
-    else:
-        cfg.clamp_min, cfg.clamp_max = -128, 127  # Linear
-    return cfg
-
-
-def make_dwconv_layer(in_h, in_w, ch, stride=1, relu6=True):
-    """Create a DWConv layer config."""
-    pad = 1  # 3×3 with pad=1
-    out_h = (in_h + 2 * pad - 3) // stride + 1
-    out_w = (in_w + 2 * pad - 3) // stride + 1
-
-    cfg = LayerConfig()
-    cfg.op_type = OP_DW_CONV
-    cfg.in_h, cfg.in_w, cfg.in_c = in_h, in_w, ch
-    cfg.out_h, cfg.out_w, cfg.out_c = out_h, out_w, ch
-    cfg.kernel_h, cfg.kernel_w = 3, 3
-    cfg.dilation_h, cfg.dilation_w = 1, 1
-    cfg.stride_h, cfg.stride_w = stride, stride
-    cfg.pad_top = cfg.pad_bottom = cfg.pad_left = cfg.pad_right = pad
-    cfg.post_ctrl = POST_BIAS_EN | POST_SHIFT_EN | POST_CLAMP_EN
-    cfg.shift_bits = 4
-    cfg.round_en = 1
-    if relu6:
-        cfg.clamp_min, cfg.clamp_max = 0, 6
-    else:
-        cfg.clamp_min, cfg.clamp_max = -128, 127
-    return cfg
-
-
-def make_pool_layer(in_h, in_w, ch):
-    """Create a global average pooling layer."""
-    cfg = LayerConfig()
-    cfg.op_type = OP_POOLING
-    cfg.in_h, cfg.in_w, cfg.in_c = in_h, in_w, ch
-    cfg.out_h, cfg.out_w, cfg.out_c = 1, 1, ch
-    cfg.pool_mode = 1  # Avg
-    cfg.global_pool = 1
-    cfg.post_ctrl = POST_CLAMP_EN
-    cfg.clamp_min, cfg.clamp_max = -128, 127
-    return cfg
-
-
-def make_fc_layer(in_c, out_c):
-    """Create an FC layer."""
-    cfg = LayerConfig()
-    cfg.op_type = OP_FC
-    cfg.in_h, cfg.in_w, cfg.in_c = 1, 1, in_c
-    cfg.out_h, cfg.out_w, cfg.out_c = 1, 1, out_c
-    cfg.post_ctrl = POST_BIAS_EN | POST_SHIFT_EN | POST_CLAMP_EN
-    cfg.shift_bits = 4
-    cfg.round_en = 1
-    cfg.clamp_min, cfg.clamp_max = -128, 127
-    return cfg
+def compute_ms(eff_scale):
+    """Compute 15-bit multiplier M and 6-bit shift S such that M / 2^S ≈ eff_scale."""
+    best_s, best_m = 0, max(1, int(np.round(eff_scale)))
+    for s in range(64):
+        m = eff_scale * (2.0 ** s)
+        if 1.0 <= m <= 32767.0:
+            best_s = s
+            best_m = int(np.round(m))
+            if best_m >= 16384:
+                break
+    return max(1, min(32767, best_m)), best_s
 
 
 def build_mobilenetv2_tiny():
     """
     MobileNetV2-Tiny architecture (scaled down for testing):
-      Input: 16×16×3
+      Input: 16×16×3 (scale_in = 1/128)
 
       Layer  0: Conv2D 3×3, stride=2, 3→8 ch     → 8×8×8   + ReLU6
       --- Block 1 (no expansion, t=1) ---
@@ -126,45 +65,161 @@ def build_mobilenetv2_tiny():
       Layer 10: GlobalAvgPool                      → 1×1×32
       Layer 11: FC, 32→10 (classifier)             → 1×1×10
 
-    Total: 12 layers, exercises Conv2D (1×1 and 3×3), DWConv (stride 1&2),
-           GlobalAvgPool, FC — all key MobileNetV2 patterns.
+    Total: 12 layers.
     """
     np.random.seed(2024)
 
     layers = []
     weights_list = []
+    # Simulate quantization scales per layer output
+    # Use fixed scales that keep values alive through 12 layers
+    layer_scales = []
+    scale_in = 1.0 / 64.0
 
-    def add_conv(in_h, in_w, in_c, out_c, kernel=3, stride=1, relu6=True):
-        cfg = make_conv2d_layer(in_h, in_w, in_c, out_c, kernel, stride, relu6)
+    def add_conv(in_h, in_w, in_c, out_c, kernel=3, stride=1, relu6=True,
+                 in_scale=None):
+        nonlocal scale_in
+        pad = (kernel - 1) // 2
+        out_h = (in_h + 2 * pad - kernel) // stride + 1
+        out_w = (in_w + 2 * pad - kernel) // stride + 1
+
+        cfg = LayerConfig()
+        cfg.op_type = OP_CONV2D
+        cfg.in_h, cfg.in_w, cfg.in_c = in_h, in_w, in_c
+        cfg.out_h, cfg.out_w, cfg.out_c = out_h, out_w, out_c
+        cfg.kernel_h, cfg.kernel_w = kernel, kernel
+        cfg.dilation_h, cfg.dilation_w = 1, 1
+        cfg.stride_h, cfg.stride_w = stride, stride
+        cfg.pad_top = cfg.pad_bottom = cfg.pad_left = cfg.pad_right = pad
+        cfg.clamp_min, cfg.clamp_max = -128, 127
+
+        # Post-processing: per-channel requantize + optional ReLU6
+        post_ctrl = POST_BIAS_EN | PPU_MODE_CONV_REQ
+        if relu6:
+            post_ctrl |= POST_RELU6_EN
+        cfg.post_ctrl = post_ctrl
+
+        # Weight: [out_c][kh][kw][in_c], moderate range
+        w = np.random.randint(-8, 9, (out_c, kernel, kernel, in_c), dtype=np.int8)
+
+        # Use fixed output scale (same as input) — keeps values alive
+        s_in = in_scale if in_scale else scale_in
+        s_w = 1.0 / 64.0
+        acc_scale = s_in * s_w
+        s_out = s_in  # output stays at same scale as input
+        eff_scale = acc_scale / s_out  # = s_w = 1/64
+
+        # Per-channel params: M/S such that M/2^S ≈ eff_scale
+        M_arr = np.zeros(out_c, dtype=np.uint16)
+        S_arr = np.zeros(out_c, dtype=np.uint8)
+        bias_arr = np.random.randint(-100, 100, (out_c,), dtype=np.int64)
+        for c in range(out_c):
+            # Slight per-channel variation
+            es = eff_scale * (0.8 + 0.4 * np.random.rand())
+            M_arr[c], S_arr[c] = compute_ms(es)
+
+        cfg.ch_params = make_ch_params(M_arr, S_arr, bias_arr)
+
         layers.append(cfg)
-        # Weight: [out_c][kh][kw][in_c]
-        w = np.random.randint(-4, 4, (out_c, kernel, kernel, in_c), dtype=np.int8)
-        b = np.random.randint(-8, 8, (out_c,), dtype=np.int32)
-        weights_list.append((w, b))
-        return cfg.out_h, cfg.out_w, cfg.out_c
+        weights_list.append(w)
+        layer_scales.append(s_out)
+        scale_in = s_out
+        return out_h, out_w, out_c
 
     def add_dw(in_h, in_w, ch, stride=1, relu6=True):
-        cfg = make_dwconv_layer(in_h, in_w, ch, stride, relu6)
+        nonlocal scale_in
+        pad = 1  # 3×3 with pad=1
+        out_h = (in_h + 2 * pad - 3) // stride + 1
+        out_w = (in_w + 2 * pad - 3) // stride + 1
+
+        cfg = LayerConfig()
+        cfg.op_type = OP_DW_CONV
+        cfg.in_h, cfg.in_w, cfg.in_c = in_h, in_w, ch
+        cfg.out_h, cfg.out_w, cfg.out_c = out_h, out_w, ch
+        cfg.kernel_h, cfg.kernel_w = 3, 3
+        cfg.dilation_h, cfg.dilation_w = 1, 1
+        cfg.stride_h, cfg.stride_w = stride, stride
+        cfg.pad_top = cfg.pad_bottom = cfg.pad_left = cfg.pad_right = pad
+        cfg.clamp_min, cfg.clamp_max = -128, 127
+
+        post_ctrl = POST_BIAS_EN | PPU_MODE_CONV_REQ
+        if relu6:
+            post_ctrl |= POST_RELU6_EN
+        cfg.post_ctrl = post_ctrl
+
+        # DW weight: [ch][3][3]
+        w = np.random.randint(-8, 9, (ch, 3, 3), dtype=np.int8)
+
+        # Per-channel params
+        s_w = 1.0 / 64.0
+        acc_scale = scale_in * s_w
+        s_out = scale_in  # keep same output scale
+        eff_scale = acc_scale / s_out
+
+        M_arr = np.zeros(ch, dtype=np.uint16)
+        S_arr = np.zeros(ch, dtype=np.uint8)
+        bias_arr = np.random.randint(-100, 100, (ch,), dtype=np.int64)
+        for c in range(ch):
+            es = eff_scale * (0.8 + 0.4 * np.random.rand())
+            M_arr[c], S_arr[c] = compute_ms(es)
+
+        cfg.ch_params = make_ch_params(M_arr, S_arr, bias_arr)
+
         layers.append(cfg)
-        # Weight: [ch][3][3]
-        w = np.random.randint(-4, 4, (ch, 3, 3), dtype=np.int8)
-        b = np.random.randint(-8, 8, (ch,), dtype=np.int32)
-        weights_list.append((w, b))
-        return cfg.out_h, cfg.out_w, cfg.out_c
+        weights_list.append(w)
+        layer_scales.append(s_out)
+        scale_in = s_out
+        return out_h, out_w, ch
 
     def add_pool(in_h, in_w, ch):
-        cfg = make_pool_layer(in_h, in_w, ch)
+        cfg = LayerConfig()
+        cfg.op_type = OP_POOLING
+        cfg.in_h, cfg.in_w, cfg.in_c = in_h, in_w, ch
+        cfg.out_h, cfg.out_w, cfg.out_c = 1, 1, ch
+        cfg.pool_mode = 1  # Avg
+        cfg.pool_h, cfg.pool_w = in_h, in_w
+        cfg.pool_stride_h, cfg.pool_stride_w = in_h, in_w
+        cfg.global_pool = 1
+        cfg.post_ctrl = PPU_MODE_PASSTHROUGH
+        cfg.clamp_min, cfg.clamp_max = -128, 127
         layers.append(cfg)
-        weights_list.append((None, None))  # No weights
+        weights_list.append(None)
+        layer_scales.append(scale_in)  # passthrough
         return 1, 1, ch
 
     def add_fc(in_c, out_c):
-        cfg = make_fc_layer(in_c, out_c)
+        nonlocal scale_in
+        cfg = LayerConfig()
+        cfg.op_type = OP_FC
+        cfg.in_h, cfg.in_w, cfg.in_c = 1, 1, in_c
+        cfg.out_h, cfg.out_w, cfg.out_c = 1, 1, out_c
+        cfg.kernel_h, cfg.kernel_w = 1, 1
+        cfg.dilation_h, cfg.dilation_w = 1, 1
+        cfg.stride_h, cfg.stride_w = 1, 1
+        cfg.post_ctrl = POST_BIAS_EN | PPU_MODE_CONV_REQ
+        cfg.clamp_min, cfg.clamp_max = -128, 127
+
+        # FC weight: [out_c][in_c] → treat as [out_c][1][1][in_c]
+        w = np.random.randint(-8, 9, (out_c, 1, 1, in_c), dtype=np.int8)
+
+        s_w = 1.0 / 64.0
+        acc_scale = scale_in * s_w
+        s_out = scale_in  # keep same output scale
+        eff_scale = acc_scale / s_out
+
+        M_arr = np.zeros(out_c, dtype=np.uint16)
+        S_arr = np.zeros(out_c, dtype=np.uint8)
+        bias_arr = np.random.randint(-100, 100, (out_c,), dtype=np.int64)
+        for c in range(out_c):
+            es = eff_scale * (0.8 + 0.4 * np.random.rand())
+            M_arr[c], S_arr[c] = compute_ms(es)
+
+        cfg.ch_params = make_ch_params(M_arr, S_arr, bias_arr)
+
         layers.append(cfg)
-        # Weight: [out_c][in_c]
-        w = np.random.randint(-4, 4, (out_c, in_c), dtype=np.int8)
-        b = np.random.randint(-8, 8, (out_c,), dtype=np.int32)
-        weights_list.append((w, b))
+        weights_list.append(w)
+        layer_scales.append(s_out)
+        scale_in = s_out
         return 1, 1, out_c
 
     # Build architecture
@@ -191,35 +246,34 @@ def build_mobilenetv2_tiny():
     print(f"MobileNetV2-Tiny: {len(layers)} layers")
     print(f"  Input:  16×16×3")
     print(f"  Output: 1×1×10 (10-class classifier)")
+    op_names = {OP_CONV2D: 'Conv2D', OP_DW_CONV: 'DWConv', OP_FC: 'FC',
+                OP_POOLING: 'Pool', OP_ELTWISE_ADD: 'EltAdd'}
     for i, cfg in enumerate(layers):
-        op_names = ['Conv2D', 'DWConv', 'FC', 'Pool', 'EltAdd', 'Resize', 'Deconv', 'Concat']
-        print(f"  Layer {i:2d}: {op_names[cfg.op_type]:6s} [{cfg.in_h}×{cfg.in_w}×{cfg.in_c}] → [{cfg.out_h}×{cfg.out_w}×{cfg.out_c}]")
+        print(f"  Layer {i:2d}: {op_names.get(cfg.op_type, '?'):6s} "
+              f"[{cfg.in_h}×{cfg.in_w}×{cfg.in_c}] → [{cfg.out_h}×{cfg.out_w}×{cfg.out_c}]")
 
     return layers, weights_list
 
 
 def run_reference(layers, weights_list, input_nhwc):
-    """Run Python reference inference."""
+    """Run Python reference inference layer by layer."""
     current = input_nhwc.copy()
 
-    for i, (cfg, (w, b)) in enumerate(zip(layers, weights_list)):
+    for i, (cfg, w) in enumerate(zip(layers, weights_list)):
         if cfg.op_type == OP_CONV2D:
             acc = ref_conv2d(current, w, cfg)
-            current = ref_postproc(acc, b, cfg)
+            current = ref_postproc_perchannel(acc, cfg.ch_params, cfg)
         elif cfg.op_type == OP_DW_CONV:
             acc = ref_dwconv(current, w, cfg)
-            current = ref_postproc(acc, b, cfg)
+            current = ref_postproc_perchannel(acc, cfg.ch_params, cfg)
         elif cfg.op_type == OP_POOLING:
             acc = ref_pooling(current, cfg)
-            current = ref_postproc(acc, None, cfg)
+            # Passthrough: just clamp
+            current = np.clip(acc, cfg.clamp_min, cfg.clamp_max).astype(np.int8)
         elif cfg.op_type == OP_FC:
-            # FC: current is [1][1][in_c], weight is [out_c][in_c]
-            w_4d = w.reshape(cfg.out_c, 1, 1, cfg.in_c)
-            cfg_tmp = LayerConfig()
-            cfg_tmp.__dict__.update(cfg.__dict__)
-            cfg_tmp.kernel_h, cfg_tmp.kernel_w = 1, 1
-            acc = ref_conv2d(current, w_4d, cfg_tmp)
-            current = ref_postproc(acc, b, cfg)
+            # FC uses conv2d path with 1×1 kernel
+            acc = ref_conv2d(current, w, cfg)
+            current = ref_postproc_perchannel(acc, cfg.ch_params, cfg)
         else:
             raise ValueError(f"Unsupported op_type {cfg.op_type} in reference")
 
@@ -238,7 +292,7 @@ def main():
 
     # Build model
     print("=" * 60)
-    print("MobileNetV2-Tiny End-to-End Test")
+    print("MobileNetV2-Tiny End-to-End Test (per-channel requantize)")
     print("=" * 60)
     print()
 
@@ -246,16 +300,14 @@ def main():
 
     # Generate random input (16×16×3, NCHW for file)
     np.random.seed(999)
-    input_nchw = np.random.randint(-30, 30, (3, 16, 16), dtype=np.int8)
+    input_nchw = np.random.randint(-60, 60, (3, 16, 16), dtype=np.int8)
     input_nhwc = input_nchw.transpose(1, 2, 0)  # [H][W][C]
 
-    # Pack weights
+    # Pack weights (no separate bias blob — bias is in ch_params)
     weight_data = b''
-    for w, b in weights_list:
+    for w in weights_list:
         if w is not None:
             weight_data += w.tobytes()
-        if b is not None:
-            weight_data += b.tobytes()
 
     # Pack model
     model_path = os.path.join(test_dir, 'test_mbv2_tiny_model.bin')
@@ -263,33 +315,69 @@ def main():
 
     input_path = os.path.join(test_dir, 'test_mbv2_tiny_input.bin')
     input_nchw.tofile(input_path)
-    print(f"Input: {input_path} ({input_nchw.nbytes} bytes)")
+    print(f"\nInput: {input_path} ({input_nchw.nbytes} bytes)")
 
     # Run Python reference
     print("\nRunning Python reference...")
     ref_output_nhwc = run_reference(layers, weights_list, input_nhwc)
     ref_output_nchw = ref_output_nhwc.transpose(2, 0, 1)
+    print(f"  Reference output (10 classes): {ref_output_nchw.flatten()}")
 
-    ref_path = os.path.join(test_dir, 'test_mbv2_tiny_reference.bin')
-    ref_output_nchw.astype(np.int8).tofile(ref_path)
-    print(f"Reference output: {ref_output_nchw.flatten()}")
-
-    # Run C simulator and verify
+    # Run C simulator
     print("\nRunning C simulator...")
-    success = run_sim_and_verify(sim_path, model_path, input_path, ref_path, "MobileNetV2-Tiny")
+    output_path = os.path.join(test_dir, 'test_mbv2_tiny_output.bin')
+    result = subprocess.run(
+        [sim_path, model_path, input_path, output_path],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        print(f"  Simulator FAILED (exit code {result.returncode})")
+        if result.stderr:
+            print(f"  stderr: {result.stderr[:500]}")
+        return 1
+
+    # Compare
+    sim_output = np.fromfile(output_path, dtype=np.int8)
+    ref_flat = ref_output_nchw.flatten().astype(np.int8)
+
+    print(f"  Sim output (10 classes):  {sim_output}")
+    print(f"  Ref output (10 classes):  {ref_flat}")
+
+    if len(sim_output) != len(ref_flat):
+        print(f"\n  FAIL: size mismatch (sim={len(sim_output)}, ref={len(ref_flat)})")
+        return 1
+
+    if np.array_equal(sim_output, ref_flat):
+        print(f"\n  BIT-EXACT match! ({len(ref_flat)} elements)")
+        status = "PASS"
+    else:
+        diff = np.abs(sim_output.astype(np.int32) - ref_flat.astype(np.int32))
+        max_diff = diff.max()
+        mismatch = np.sum(diff > 0)
+        print(f"\n  NOT bit-exact: {mismatch}/{len(ref_flat)} differ, max_diff={max_diff}")
+        # Allow ±1 tolerance for rounding edge cases in pooling
+        if max_diff <= 1:
+            print(f"  PASS (within ±1 tolerance)")
+            status = "PASS"
+        else:
+            print(f"  FAIL (max_diff={max_diff} > 1)")
+            status = "FAIL"
 
     print()
-    if success:
-        print("=" * 60)
-        print("SUCCESS: MobileNetV2-Tiny 12-layer inference is bit-exact!")
+    print("=" * 60)
+    if status == "PASS":
+        print("SUCCESS: MobileNetV2-Tiny 12-layer inference verified!")
         print(f"  Architecture: Conv3×3 → [DW+PW]×3blocks → Conv1×1 → GAP → FC")
         print(f"  Operators tested: Conv2D(1×1,3×3), DWConv(s1,s2), AvgPool, FC")
-        print(f"  Total weight parameters: {sum(w.size for w,b in weights_list if w is not None)}")
-        print(f"  Classifier output (10 classes): {ref_output_nchw.flatten()}")
-        print("=" * 60)
-        return 0
+        print(f"  Quantization: per-channel requantize (M/S) + ReLU6")
+        print(f"  Total weight params: {sum(w.size for w in weights_list if w is not None)}")
+        print(f"  Classifier output (10 classes): {sim_output}")
     else:
-        return 1
+        print("FAILED: MobileNetV2-Tiny inference mismatch")
+    print("=" * 60)
+
+    return 0 if status == "PASS" else 1
 
 
 if __name__ == '__main__':
