@@ -13,9 +13,11 @@ SPDX-License-Identifier: Apache-2.0
 """
 
 import argparse
+import math
 import os
 import sys
 import glob
+import tempfile
 import numpy as np
 import onnx
 from onnx import numpy_helper, shape_inference
@@ -29,7 +31,10 @@ from model_packer import (
     OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD, OP_RESIZE, OP_CONCAT,
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
     PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_RELU_ONLY, PPU_MODE_PASSTHROUGH,
+    SCHED_CTRL_DB_EN, SCHED_CTRL_FUSE_START, SCHED_CTRL_FUSE_MID, SCHED_CTRL_FUSE_END,
 )
+from tiling import compute_tiling
+from layer_fusion import detect_fusible_blocks, compute_fused_tiling
 
 
 # ─── Utility ───
@@ -60,12 +65,11 @@ def preprocess_image_from_file(path, input_shape, mean=None, std=None):
 
 
 def preprocess_int8_input(path, input_shape):
-    """Load debug.bin (INT8 NCHW) and convert to float32 for ONNX Runtime.
-    Transform: (int8_value - 127.5) / 255
+    """Load debug.bin (uint8 NCHW) and convert to float32 for ONNX Runtime.
+    Transform: (uint8_value - 127.5) / 255
     """
     _, c, h, w = input_shape
-    data = np.fromfile(path, dtype=np.int8).reshape(1, c, h, w)
-    # User specified: float = (int8_val - 127.5) / 255
+    data = np.fromfile(path, dtype=np.uint8).reshape(1, c, h, w)
     return (data.astype(np.float32) - 127.5) / 255.0
 
 
@@ -163,8 +167,10 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
             model.graph.output.append(
                 onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, None))
 
-    # Save temp model
-    temp_path = '/tmp/calib_model.onnx'
+    # Save temp model (unique per-process to avoid conflicts)
+    tmp_fd = tempfile.NamedTemporaryFile(suffix='.onnx', prefix='npu_calib_', delete=False)
+    temp_path = tmp_fd.name
+    tmp_fd.close()
     onnx.save(model, temp_path)
 
     sess = ort.InferenceSession(temp_path, providers=['CPUExecutionProvider'])
@@ -261,6 +267,21 @@ def compute_scale_zp_asymmetric(vmin, vmax, bits=8):
     zp = int(np.round(qmin - vmin / scale))
     zp = max(qmin, min(qmax, zp))
     return scale, zp
+
+
+def compute_ms(eff_scale):
+    """Compute 15-bit multiplier M and 6-bit shift S such that M / 2^S ≈ eff_scale.
+    Used for Add dual-rescale and Concat per-branch requantize.
+    """
+    best_s, best_m = 0, max(1, int(np.round(eff_scale)))
+    for s in range(64):  # S field is 6-bit, supports 0..63
+        m = eff_scale * (2.0 ** s)
+        if 1.0 <= m <= 32767.0:
+            best_s = s
+            best_m = int(np.round(m))
+            if best_m >= 16384:
+                break
+    return max(1, min(32767, best_m)), best_s
 
 
 def quantize_weight_perchannel(weight, out_axis=0, bits=8):
@@ -753,6 +774,17 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     # Map: tensor_name → fused layer index (for residual tracking)
     tensor_to_layer_idx = {}
 
+    def compute_input_src(input_tensor_name):
+        """Determine input_src for a layer given its primary input tensor name.
+        Returns -1 if input comes from immediately previous layer, else the source layer index."""
+        prev_idx = len(npu_layers) - 1  # index that will be "previous layer" for the next layer
+        resolved = resolve_passthrough(input_tensor_name)
+        src_idx = tensor_to_layer_idx.get(input_tensor_name,
+                    tensor_to_layer_idx.get(resolved, -1))
+        if src_idx < 0 or src_idx == prev_idx:
+            return -1  # default: read from previous layer (or graph input)
+        return src_idx
+
     def get_tensor_quant(tensor_name):
         """Look up quantization params, resolving passthrough ops."""
         if tensor_name in tensor_quant:
@@ -880,6 +912,12 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 ))
             cfg.ch_params = ch_params
 
+            # Determine input source layer
+            cfg.input_src = compute_input_src(input_tensor)
+            if cfg.input_src >= 0:
+                print(f"    ** Conv[{len(npu_layers)}] input_src=L{cfg.input_src} "
+                      f"(non-sequential input)")
+
             npu_layers.append(cfg)
             # Track this layer's output tensor
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
@@ -918,17 +956,6 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             tensor_quant[eff_output] = (scale_out, zp_out)
 
             # Compute M_A, S_A, M_B, S_B
-            def compute_ms(eff_scale):
-                best_s, best_m = 0, max(1, int(np.round(eff_scale)))
-                for s in range(64):  # S field is 6-bit, supports 0..63
-                    m = eff_scale * (2.0 ** s)
-                    if 1.0 <= m <= 32767.0:
-                        best_s = s
-                        best_m = int(np.round(m))
-                        if best_m >= 16384:
-                            break
-                return max(1, min(32767, best_m)), best_s
-
             eff_a = scale_a / scale_out
             eff_b = scale_b / scale_out
             M_A, S_A = compute_ms(eff_a)
@@ -987,9 +1014,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 # Fallback: pick the one with higher index as "current"
                 if idx_a > idx_b:
                     cfg.residual_src = idx_b
+                    cfg.input_src = idx_a
                 else:
                     cfg.add_params = AddParam(M_A=M_B, S_A=S_B, M_B=M_A, S_B=S_A)
                     cfg.residual_src = idx_a
+                    cfg.input_src = idx_b
 
             print(f"    Add[{len(npu_layers)}]: input_a=L{idx_a}, input_b=L{idx_b}, "
                   f"residual_src=L{cfg.residual_src}")
@@ -1007,10 +1036,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 tensor_quant[input_tensor] = (s, z)
             scale_in, zp_in = tensor_quant[input_tensor]
 
-            # Output scale from calibration (pooling doesn't change scale much)
-            out_range = get_range(eff_output, is_relu_output=has_act)
-            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
-            tensor_quant[eff_output] = (scale_out, zp_out)
+            # Pool output inherits input scale (values stay in same domain)
+            tensor_quant[eff_output] = (scale_in, zp_in)
 
             # Dimensions
             _, _, ih, iw = node.input_shape if node.input_shape else [1, 1, 1, 1]
@@ -1061,6 +1088,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             print(f"    Pool[{len(npu_layers)}]: {node.op_type} "
                   f"k={kernel_shape} s={pool_strides} "
                   f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
+
+            # Determine input source layer
+            cfg.input_src = compute_input_src(input_tensor)
 
             npu_layers.append(cfg)
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
@@ -1191,6 +1221,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 ))
             cfg.ch_params = ch_params
 
+            # Determine input source layer
+            cfg.input_src = compute_input_src(input_tensor)
+
             npu_layers.append(cfg)
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
             tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
@@ -1205,7 +1238,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         elif op['type'] == 'concat':
             # Concat: emit one sub-layer per input branch
             # Each sub-layer copies its input channels into the output at concat_offset
-            # No requantization — passthrough (values stay in same quantized domain)
+            # Per-branch requantize: rescale each branch to unified output scale
             axis = node.attrs.get('axis', 1)  # typically axis=1 (channel dim in NCHW)
 
             # Get all non-weight inputs (the data inputs to concat)
@@ -1248,6 +1281,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             else:
                 oh, ow = 1, 1
 
+            # Compute unified output scale BEFORE emitting branches
+            out_range = get_range(eff_output)
+            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
+            tensor_quant[eff_output] = (scale_out, zp_out)
+
             # Emit one Concat sub-layer per input
             offset = 0
             for branch_idx, (inp_name, ch_count) in enumerate(
@@ -1257,6 +1295,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                     r = get_range(inp_name)
                     s, z = compute_scale_zp_symmetric(r[0], r[1], bits)
                     tensor_quant[inp_name] = (s, z)
+
+                # Per-branch requantize: M/S to convert from branch scale to output scale
+                scale_branch, _ = tensor_quant[inp_name]
+                eff_branch = scale_branch / scale_out
+                M_branch, S_branch = compute_ms(eff_branch)
 
                 # Determine source layer for residual_src
                 resolved_inp = resolve_passthrough(inp_name)
@@ -1281,6 +1324,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                     post_ctrl=PPU_MODE_PASSTHROUGH,
                     clamp_min=qmin, clamp_max=qmax,
                     residual_src=residual,
+                    add_params=AddParam(M_A=M_branch, S_A=S_branch, M_B=0, S_B=0),
                 )
                 if bits == 16:
                     cfg.post_ctrl |= POST_INT16_OUT
@@ -1289,15 +1333,12 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 offset += ch_count
 
             # Track the concat output tensor
-            # Use calibrated range for the concat output (covers both branches)
-            out_range = get_range(eff_output)
-            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
-            tensor_quant[eff_output] = (scale_out, zp_out)
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
             tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
 
             print(f"    Concat[{len(npu_layers)-len(concat_inputs)}..{len(npu_layers)-1}]: "
-                  f"{len(concat_inputs)} branches, channels={input_channels}, total={total_c}")
+                  f"{len(concat_inputs)} branches, channels={input_channels}, total={total_c}, "
+                  f"requantize to scale={scale_out:.6f}")
 
         elif op['type'] == 'resize':
             # Resize/Upsample: no weights, passthrough quantization
@@ -1354,12 +1395,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                     # Last fallback: assume 2x
                     oh, ow, oc = ih * 2, iw * 2, ic
 
-            # Output quant: passthrough (same scale as input)
-            # For nearest, values are identical to input pixels
-            # For bilinear, interpolation stays within input range
-            out_range = get_range(eff_output, is_relu_output=has_act)
-            scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
-            tensor_quant[eff_output] = (scale_out, zp_out)
+            # Resize output inherits input scale (values stay in same domain)
+            tensor_quant[eff_output] = (scale_in, zp_in)
 
             post_ctrl = PPU_MODE_PASSTHROUGH
             if bits == 16:
@@ -1381,6 +1418,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 clamp_min=qmin, clamp_max=qmax,
             )
 
+            # Determine input source layer
+            cfg.input_src = compute_input_src(input_tensor)
+
             npu_layers.append(cfg)
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
             tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
@@ -1389,6 +1429,105 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             print(f"    Resize[{len(npu_layers)-1}]: {mode_name} "
                   f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
 
+    # 4b. Compute tiling for each layer (adaptive: per-layer single/double buffer)
+    op_type_names = {OP_CONV2D: 'conv', OP_DW_CONV: 'dw', OP_FC: 'fc',
+                     OP_POOLING: 'pool', OP_ELTWISE_ADD: 'add',
+                     OP_RESIZE: 'resize', OP_CONCAT: 'concat'}
+    elem_size = 2 if bits == 16 else 1
+    tiled_count = 0
+    db_count = 0
+    for cfg in npu_layers:
+        op_name = op_type_names.get(cfg.op_type, 'conv')
+        # Compute tiling for both modes (single/double buffer)
+        tile_sb = compute_tiling(
+            op_type=op_name,
+            in_h=cfg.in_h, in_w=cfg.in_w, in_c=cfg.in_c,
+            out_h=cfg.out_h, out_w=cfg.out_w, out_c=cfg.out_c,
+            kernel_h=cfg.kernel_h, kernel_w=cfg.kernel_w,
+            stride_h=cfg.stride_h, stride_w=cfg.stride_w,
+            dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
+            elem_size=elem_size,
+            double_buffer=False,
+        )
+        tile_db = compute_tiling(
+            op_type=op_name,
+            in_h=cfg.in_h, in_w=cfg.in_w, in_c=cfg.in_c,
+            out_h=cfg.out_h, out_w=cfg.out_w, out_c=cfg.out_c,
+            kernel_h=cfg.kernel_h, kernel_w=cfg.kernel_w,
+            stride_h=cfg.stride_h, stride_w=cfg.stride_w,
+            dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
+            elem_size=elem_size,
+            double_buffer=True,
+        )
+        # Use double-buffer tiling by default (enables overlap);
+        # fall back to single-buffer if DB causes excessive tile fragmentation
+        # Heuristic: if DB tile count > 4x SB tile count, prefer SB
+        sb_tiles = max(1, tile_sb['tile_num_h']) * max(1, tile_sb['tile_num_w'])
+        db_tiles = max(1, tile_db['tile_num_h']) * max(1, tile_db['tile_num_w'])
+        sb_oc_groups = math.ceil(cfg.out_c / tile_sb.get('tile_oc', cfg.out_c)) if tile_sb.get('tile_oc', cfg.out_c) > 0 else 1
+        db_oc_groups = math.ceil(cfg.out_c / tile_db.get('tile_oc', cfg.out_c)) if tile_db.get('tile_oc', cfg.out_c) > 0 else 1
+        sb_total = sb_tiles * sb_oc_groups
+        db_total = db_tiles * db_oc_groups
+
+        if db_total <= sb_total * 4:
+            # Double-buffer: acceptable tile count
+            tile = tile_db
+            cfg.sched_ctrl = SCHED_CTRL_DB_EN
+            db_count += 1
+        else:
+            # Single-buffer: DB fragmentation too severe
+            tile = tile_sb
+            cfg.sched_ctrl = 0
+
+        cfg.tile_h = tile['tile_h']
+        cfg.tile_w = tile['tile_w']
+        cfg.tile_num_h = tile['tile_num_h']
+        cfg.tile_num_w = tile['tile_num_w']
+        if tile['tile_num_h'] > 0:
+            tiled_count += 1
+    print(f"\n=== Tiling: {tiled_count}/{len(npu_layers)} layers need tiling ===")
+    print(f"=== DMA mode: {db_count} double-buffer, {len(npu_layers)-db_count} single-buffer ===")
+
+    # 4c. Detect and mark fusible blocks (Conv1×1 → DW3×3 → Conv1×1)
+    OP_STR_MAP = {OP_CONV2D: 'conv', OP_DW_CONV: 'dw', OP_FC: 'fc',
+                  OP_POOLING: 'pool', OP_ELTWISE_ADD: 'add',
+                  OP_RESIZE: 'resize', OP_CONCAT: 'concat'}
+
+    # Build a list of dicts for detection (layer_fusion expects string op_type)
+    layer_dicts = []
+    for cfg in npu_layers:
+        layer_dicts.append({
+            'op_type': OP_STR_MAP.get(cfg.op_type, 'conv'),
+            'in_h': cfg.in_h, 'in_w': cfg.in_w, 'in_c': cfg.in_c,
+            'out_h': cfg.out_h, 'out_w': cfg.out_w, 'out_c': cfg.out_c,
+            'kernel_h': cfg.kernel_h, 'kernel_w': cfg.kernel_w,
+            'stride_h': cfg.stride_h, 'stride_w': cfg.stride_w,
+        })
+
+    fused_blocks = detect_fusible_blocks(layer_dicts)
+    fused_count = 0
+    for block in fused_blocks:
+        # Check feasibility: compute fused tiling within SRAM constraints
+        tiling = compute_fused_tiling(block, elem_size)
+        if not tiling.feasible:
+            continue
+        # Mark layers with fusion bits (preserve existing sched_ctrl bits)
+        npu_layers[block.start_idx].sched_ctrl |= SCHED_CTRL_FUSE_START
+        npu_layers[block.start_idx + 1].sched_ctrl |= SCHED_CTRL_FUSE_MID
+        npu_layers[block.end_idx].sched_ctrl |= SCHED_CTRL_FUSE_END
+        # Override tile_h/tile_w for the first layer to match fused tiling
+        npu_layers[block.start_idx].tile_h = tiling.tile_h
+        npu_layers[block.start_idx].tile_w = tiling.tile_w
+        # Recompute tile_num for fused spatial
+        npu_layers[block.start_idx].tile_num_h = math.ceil(block.out_h / tiling.tile_h)
+        npu_layers[block.start_idx].tile_num_w = math.ceil(block.out_w / tiling.tile_w)
+        fused_count += 1
+
+    if fused_count > 0:
+        print(f"=== Fusion: {fused_count} blocks marked for fused execution ===")
+    else:
+        print(f"=== Fusion: no fusible blocks detected ===")
+
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")
     all_weights_bin = b''.join(weight_blobs)
@@ -1396,8 +1535,22 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     # 6. Prepare input tensor
     print(f"\n=== Preparing input tensor ===")
-    if input_format == 'int8-nchw':
-        # Read raw pixel bytes (uint8 NCHW), quantize to target bit-width for NPU
+    if input_path.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+        # Image file: load, resize, apply post-fold preprocessing (pixel-127.5)/255
+        img = Image.open(input_path).convert('RGB')
+        _, c, h, w = input_shape
+        img = img.resize((w, h), Image.BILINEAR)
+        raw = np.array(img, dtype=np.float32).transpose(2, 0, 1)[np.newaxis, ...]
+        float_val = (raw - 127.5) / 255.0
+        input_q = np.round(float_val / in_scale).astype(np.int32)
+        input_q = np.clip(input_q, qmin, qmax)
+        if bits == 16:
+            input_q = input_q.astype(np.int16)
+        else:
+            input_q = input_q.astype(np.int8)
+    elif input_format == 'int8-nchw':
+        # Canonical debug.bin format: uint8 NCHW (pixel values 0-255)
+        # Normalization: float = (pixel_uint8 - 127.5) / 255 → range [-0.5, 0.5]
         raw = np.fromfile(input_path, dtype=np.uint8).reshape(input_shape)
         # Input preprocessing matches calibration: float = (pixel_uint8 - 127.5) / 255
         # input_q = round(float_val / in_scale)
