@@ -12,6 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 """
 
 import os
+import tempfile
 import sys
 import numpy as np
 import onnxruntime as ort
@@ -22,14 +23,19 @@ INPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'deb
 CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'a3_train_images')
 
 
+def preprocess_uint8_nchw(raw_u8):
+    """Canonical input preprocessing: (uint8 - 127.5) / 255.0."""
+    return (raw_u8.astype(np.float32) - 127.5) / 255.0
+
+
 def load_calibration_images(calib_dir, max_images=400):
-    """Load calibration images as float32 NCHW [0, 1]."""
+    """Load calibration images as float32 NCHW using canonical preprocessing."""
     files = sorted([f for f in os.listdir(calib_dir) if f.endswith('.jpg')])[:max_images]
     images = []
     for f in files:
-        img = np.array(Image.open(os.path.join(calib_dir, f))).astype(np.float32) / 255.0
-        img_nchw = img.transpose(2, 0, 1)[np.newaxis, ...]
-        images.append(img_nchw)
+        img = np.array(Image.open(os.path.join(calib_dir, f)).convert('RGB'), dtype=np.uint8)
+        img_nchw_u8 = img.transpose(2, 0, 1)[np.newaxis, ...]
+        images.append(preprocess_uint8_nchw(img_nchw_u8))
     return images
 
 
@@ -57,7 +63,6 @@ def collect_activation_ranges(model_path, images):
                             added.append(out)
                             break
 
-    import tempfile
     tmp_fd = tempfile.NamedTemporaryFile(suffix='.onnx', prefix='npu_q16_', delete=False)
     tmp_path = tmp_fd.name
     tmp_fd.close()
@@ -307,7 +312,7 @@ def main():
 
     # Load test input
     data = np.fromfile(INPUT_PATH, dtype=np.uint8).reshape(1, 3, 224, 224)
-    input_nchw = (data.astype(np.float32) - 127.5) / 255.0
+    input_nchw = preprocess_uint8_nchw(data)
 
     # FP32 reference
     print("\nRunning FP32 reference...")
