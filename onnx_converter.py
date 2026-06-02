@@ -49,10 +49,16 @@ def preprocess_image_from_file(path, input_shape, mean=None, std=None):
         arr = (pixel - 127.5) / 255  → range [-0.5, 0.5]
     """
     _, c, h, w = input_shape
-    img = Image.open(path).convert('RGB')
-    img = img.resize((w, h), Image.BILINEAR)
-    arr = np.array(img, dtype=np.float32)  # [H,W,3]
-    arr = arr.transpose(2, 0, 1)  # [3,H,W]
+    if c == 1:
+        img = Image.open(path).convert('L')
+        img = img.resize((w, h), Image.BILINEAR)
+        arr = np.array(img, dtype=np.float32)  # [H,W]
+        arr = arr[np.newaxis, :, :]  # [1,H,W]
+    else:
+        img = Image.open(path).convert('RGB')
+        img = img.resize((w, h), Image.BILINEAR)
+        arr = np.array(img, dtype=np.float32)  # [H,W,3]
+        arr = arr.transpose(2, 0, 1)  # [3,H,W]
     if mean is not None and std is not None:
         # ImageNet-style: normalize to (pixel/255 - mean) / std
         mean_arr = np.array(mean, dtype=np.float32).reshape(c, 1, 1)
@@ -177,9 +183,9 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
     sess = ort.InferenceSession(temp_path, providers=['CPUExecutionProvider'])
     input_name = sess.get_inputs()[0].name
 
-    # Collect images
-    image_files = sorted(glob.glob(os.path.join(calib_dir, '*.jpg')) +
-                         glob.glob(os.path.join(calib_dir, '*.png')))
+    # Collect images (search recursively to support subdirectory structures)
+    image_files = sorted(glob.glob(os.path.join(calib_dir, '**', '*.jpg'), recursive=True) +
+                         glob.glob(os.path.join(calib_dir, '**', '*.png'), recursive=True))
     if len(image_files) == 0:
         raise ValueError(f"No images found in {calib_dir}")
     image_files = image_files[:num_images]
@@ -1543,10 +1549,15 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     print(f"\n=== Preparing input tensor ===")
     if input_path.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
         # Image file: load, resize, apply post-fold preprocessing (pixel-127.5)/255
-        img = Image.open(input_path).convert('RGB')
         _, c, h, w = input_shape
-        img = img.resize((w, h), Image.BILINEAR)
-        raw = np.array(img, dtype=np.float32).transpose(2, 0, 1)[np.newaxis, ...]
+        if c == 1:
+            img = Image.open(input_path).convert('L')
+            img = img.resize((w, h), Image.BILINEAR)
+            raw = np.array(img, dtype=np.float32)[np.newaxis, np.newaxis, :, :]  # [1,1,H,W]
+        else:
+            img = Image.open(input_path).convert('RGB')
+            img = img.resize((w, h), Image.BILINEAR)
+            raw = np.array(img, dtype=np.float32).transpose(2, 0, 1)[np.newaxis, ...]
         float_val = (raw - 127.5) / 255.0
         input_q = np.round(float_val / in_scale).astype(np.int32)
         input_q = np.clip(input_q, qmin, qmax)
