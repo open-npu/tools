@@ -128,7 +128,7 @@ def read_npu1(path):
 
         # Read add params
         if has_add:
-            M_A, S_A, _r1, M_B, S_B, _r2 = struct.unpack_from('<HBxHBx', data, off)
+            M_A, S_A, M_B, S_B = struct.unpack_from('<HBxHBx', data, off)
             off += 8
             layer.add_params = AddParam(M_A=M_A, S_A=S_A, M_B=M_B, S_B=S_B)
 
