@@ -149,13 +149,24 @@ def elem_bytes(layer):
     return 2 if layer.data_type == 1 else 1
 
 def n_input_words(layer):
+    """Per-layer input words. For tiled layers, use tile-sized input."""
     eb = elem_bytes(layer)
-    total = layer.in_h * layer.in_w * layer.in_c * eb
+    if layer.tile_h > 0 and layer.tile_w > 0:
+        # Tiled: compute input tile size (with halo for kernel overlap)
+        inp_h = (layer.tile_h - 1) * layer.stride_h + layer.kernel_h
+        inp_w = (layer.tile_w - 1) * layer.stride_w + layer.kernel_w
+        total = inp_h * inp_w * layer.in_c * eb
+    else:
+        total = layer.in_h * layer.in_w * layer.in_c * eb
     return (total + 3) // 4  # round up to word
 
 def n_output_words(layer):
+    """Per-layer output words. For tiled layers, use tile-sized output."""
     eb = elem_bytes(layer)
-    total = layer.out_h * layer.out_w * layer.out_c * eb
+    if layer.tile_h > 0 and layer.tile_w > 0:
+        total = layer.tile_h * layer.tile_w * layer.out_c * eb
+    else:
+        total = layer.out_h * layer.out_w * layer.out_c * eb
     return (total + 3) // 4
 
 def dma_in_size(layer):
@@ -210,14 +221,27 @@ def extract_layer_weights(layers, weight_blob, layer_idx):
 
 
 def pack_params_to_words(layer):
-    """Pack per-channel params into uint32 words."""
-    raw = b''
+    """Pack per-channel params into uint32 words.
+    
+    DDR format (4 words per channel, matching gen_dma_e2e_golden.py):
+      Word 0: M[14:0] | (S[5:0] << 16)
+      Word 1: ZP[15:0] | (bias[15:0] << 16)
+      Word 2: bias[47:16]
+      Word 3: bias[63:48] in [15:0]
+    """
+    words = []
     for p in layer.ch_params:
-        raw += p.pack()
-    # Pad to word boundary
-    while len(raw) % 4 != 0:
-        raw += b'\x00'
-    return np.frombuffer(raw, dtype=np.uint32)
+        m = p.M & 0x7FFF
+        s = p.S & 0x3F
+        w0 = m | (s << 16)
+        zp = p.zp & 0xFFFF
+        bias = p.bias_q
+        bias_u64 = (bias + (1 << 64)) & 0xFFFFFFFFFFFFFFFF if bias < 0 else bias & 0xFFFFFFFFFFFFFFFF
+        w1 = zp | (((bias_u64 >> 0) & 0xFFFF) << 16)
+        w2 = (bias_u64 >> 16) & 0xFFFFFFFF
+        w3 = (bias_u64 >> 48) & 0xFFFF
+        words.extend([w0, w1, w2, w3])
+    return np.array(words, dtype=np.uint32)
 
 
 def pack_input_to_words(input_nhwc, layer):
