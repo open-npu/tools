@@ -148,6 +148,12 @@ def read_npu1(path):
 def elem_bytes(layer):
     return 2 if layer.data_type == 1 else 1
 
+def n_full_input_words(layer):
+    """Full tensor input words (NOT tile)."""
+    eb = elem_bytes(layer)
+    total = layer.in_h * layer.in_w * layer.in_c * eb
+    return (total + 3) // 4
+
 def n_input_words(layer):
     """Per-layer input words. For tiled layers, use tile-sized input."""
     eb = elem_bytes(layer)
@@ -170,7 +176,7 @@ def n_output_words(layer):
     return (total + 3) // 4
 
 def dma_in_size(layer):
-    return n_input_words(layer) * 4
+    return n_full_input_words(layer) * 4
 
 def dma_out_size(layer):
     return n_output_words(layer) * 4
@@ -244,23 +250,68 @@ def pack_params_to_words(layer):
     return np.array(words, dtype=np.uint32)
 
 
-def pack_input_to_words(input_nhwc, layer):
-    """Pack input NHWC tensor into uint32 words (INT8 or INT16 packing)."""
+def pack_input_to_words(input_nhwc, layer, pad_value=0):
+    """Pack input NHWC tensor into uint32 words (INT8 or INT16 packing).
+    
+    For tiled layers, packs per-tile input regions (with halo) sequentially
+    in row-major tile order, matching the controller's sequential tile loading.
+    For non-tiled layers, packs the full input tensor.
+    """
     eb = elem_bytes(layer)
-    flat = input_nhwc.flatten()
+    dtype_u = np.uint16 if eb == 2 else np.uint8
+
     if eb == 1:
-        # INT8: 4 elements per word, little-endian
-        n_words = (len(flat) + 3) // 4
-        padded = np.zeros(n_words * 4, dtype=np.uint8)
-        padded[:len(flat)] = flat.astype(np.uint8) & 0xFF
-        return padded.view('<u4')
+        def pack_flat(flat):
+            n_words = (len(flat) + 3) // 4
+            padded = np.zeros(n_words * 4, dtype=np.uint8)
+            padded[:len(flat)] = flat.astype(np.uint8) & 0xFF
+            return padded.view('<u4')
     else:
-        # INT16: 2 elements per word
-        flat_i16 = flat.astype(np.uint16)
-        n_words = (len(flat) + 1) // 2
-        padded = np.zeros(n_words * 2, dtype=np.uint16)
-        padded[:len(flat_i16)] = flat_i16
-        return padded.view('<u4')
+        def pack_flat(flat):
+            flat_u16 = flat.astype(np.uint16)
+            n_words = (len(flat) + 1) // 2
+            padded = np.zeros(n_words * 2, dtype=np.uint16)
+            padded[:len(flat_u16)] = flat_u16
+            return padded.view('<u4')
+
+    # Non-tiled: pack full input
+    if layer.tile_h == 0 or layer.tile_w == 0:
+        return pack_flat(input_nhwc.flatten())
+
+    # Tiled: extract per-tile input regions with halo, pack sequentially
+    # Input: NHWC tensor of shape (in_h, in_w, in_c)
+    H, W, C = input_nhwc.shape
+    
+    # Compute input tile size with halo
+    inp_h = (layer.tile_h - 1) * layer.stride_h + layer.kernel_h
+    inp_w = (layer.tile_w - 1) * layer.stride_w + layer.kernel_w
+    
+    # Compute actual padded dimensions needed for ALL tiles
+    # The rightmost/bottom tiles may need more padding than pad_r/pad_b
+    max_row_end = (layer.tile_num_h - 1) * layer.stride_h * layer.tile_h + inp_h
+    max_col_end = (layer.tile_num_w - 1) * layer.stride_w * layer.tile_w + inp_w
+    pad_t, pad_l = layer.pad_top, layer.pad_left
+    # Oversized padding to accommodate all tile windows
+    pad_b_extra = max(0, max_row_end - (H + pad_t))
+    pad_r_extra = max(0, max_col_end - (W + pad_l))
+    
+    padded = np.full((H + pad_t + pad_b_extra, W + pad_l + pad_r_extra, C),
+                     pad_value - layer.in_zp, dtype=input_nhwc.dtype)
+    padded[pad_t:pad_t+H, pad_l:pad_l+W, :] = input_nhwc
+    
+    # Extract and pack each tile
+    all_words = []
+    for ty in range(layer.tile_num_h):
+        for tx in range(layer.tile_num_w):
+            # Input tile region in padded image
+            row_start = ty * layer.tile_h * layer.stride_h
+            row_end = row_start + inp_h
+            col_start = tx * layer.tile_w * layer.stride_w
+            col_end = col_start + inp_w
+            tile_data = padded[row_start:row_end, col_start:col_end, :]
+            all_words.append(pack_flat(tile_data.flatten()))
+    
+    return np.concatenate(all_words) if all_words else pack_flat(input_nhwc.flatten())
 
 
 def pack_output_to_words(output_nhwc, layer):
@@ -367,6 +418,7 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
             'dma_wgt_size': n_wgt_words(layer) * 4,
             'dma_out_size': dma_out_size(layer),
             'dma_param_count': len(layer.ch_params),
+            'tile_in_size': n_input_words(layer) * 4 if layer.tile_h > 0 else 0,
             'n_input_words': n_in,
             'n_output_words': n_out,
             'tile_h': layer.tile_h,
