@@ -908,6 +908,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 cfg.clamp_max = min(qmax, relu6_qmax)
             elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
+                cfg.post_ctrl = (cfg.post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
             if zp_out != 0:
                 cfg.post_ctrl |= POST_ZP_EN
 
@@ -991,6 +992,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 cfg.clamp_max = min(qmax, relu6_qmax)
             elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
+                cfg.post_ctrl = (cfg.post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
 
             cfg.add_params = AddParam(M_A=M_A, S_A=S_A, M_B=M_B, S_B=S_B)
 
@@ -1217,6 +1219,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 cfg.clamp_max = min(qmax, relu6_qmax)
             elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
+                cfg.post_ctrl = (cfg.post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
             if zp_out != 0:
                 cfg.post_ctrl |= POST_ZP_EN
 
@@ -1589,12 +1592,16 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     print(f"  Input quant range: [{input_q.min()}, {input_q.max()}]")
 
     # Save quantization metadata for comparison script
+    # NOTE: CSIM stores output as signed int8 bytes in symmetric quantization.
+    # When reading as uint8 (e.g. np.fromfile(..., dtype=np.uint8)), the effective
+    # zero point is 128 for proper dequantization: float = (uint8 - 128) * scale.
+    # For bits=16, output is int16 so no adjustment needed (zp_out is already 0).
     meta_path = output_path.replace('.bin', '_meta.npz')
     np.savez(meta_path,
              input_scale=in_scale,
              input_zp=in_zp,
              output_scale=scale_out,
-             output_zp=zp_out,
+             output_zp=128 if (bits == 8 and zp_out == 0) else zp_out,
              input_shape=np.array(input_shape),
              bits=bits,
              output_elements=npu_layers[-1].out_h * npu_layers[-1].out_w * npu_layers[-1].out_c)
