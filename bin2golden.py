@@ -167,10 +167,18 @@ def n_input_words(layer):
     return (total + 3) // 4  # round up to word
 
 def n_output_words(layer):
-    """Per-layer output words. For tiled layers, use tile-sized output."""
+    """Output words for DMA store.
+    
+    For tiled layers, the RTL stores only the LAST tile's output to DDR.
+    Use the last tile dimensions (which may be clipped at borders).
+    For non-tiled layers, uses the full output tensor.
+    """
     eb = elem_bytes(layer)
     if layer.tile_h > 0 and layer.tile_w > 0:
-        total = layer.tile_h * layer.tile_w * layer.out_c * eb
+        # Last tile (tile_num_h-1, tile_num_w-1) may be clipped at image border
+        last_h = min(layer.tile_h, layer.out_h - (layer.tile_num_h - 1) * layer.tile_h)
+        last_w = min(layer.tile_w, layer.out_w - (layer.tile_num_w - 1) * layer.tile_w)
+        total = last_h * last_w * layer.out_c * eb
     else:
         total = layer.out_h * layer.out_w * layer.out_c * eb
     return (total + 3) // 4

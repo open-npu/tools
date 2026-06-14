@@ -908,7 +908,6 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 cfg.clamp_max = min(qmax, relu6_qmax)
             elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
-                cfg.post_ctrl = (cfg.post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
             if zp_out != 0:
                 cfg.post_ctrl |= POST_ZP_EN
 
@@ -992,7 +991,6 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 cfg.clamp_max = min(qmax, relu6_qmax)
             elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
-                cfg.post_ctrl = (cfg.post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
 
             cfg.add_params = AddParam(M_A=M_A, S_A=S_A, M_B=M_B, S_B=S_B)
 
@@ -1219,7 +1217,6 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 cfg.clamp_max = min(qmax, relu6_qmax)
             elif op['relu']:
                 cfg.post_ctrl |= POST_RELU_EN
-                cfg.post_ctrl = (cfg.post_ctrl & ~0x03) | PPU_MODE_RELU_ONLY
             if zp_out != 0:
                 cfg.post_ctrl |= POST_ZP_EN
 
