@@ -32,6 +32,7 @@ from model_packer import (
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
     PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_RELU_ONLY, PPU_MODE_PASSTHROUGH,
     SCHED_CTRL_DB_EN, SCHED_CTRL_FUSE_START, SCHED_CTRL_FUSE_MID, SCHED_CTRL_FUSE_END,
+    SCHED_CTRL_PER_TILE_STORE,
 )
 from tiling import compute_tiling
 from layer_fusion import detect_fusible_blocks, compute_fused_tiling
@@ -364,13 +365,20 @@ def compute_requant_params(scale_in, scale_w_perchannel, scale_out, bias_float=N
         # Quantize bias: bias_q = round(bias / (scale_in * scale_w[ch]))
         if bias_float is not None:
             denom = scale_in * scale_w_perchannel[c]
-            if denom < 1e-20:
+            if denom < 1e-10:
                 # Near-zero weight channel: bias has no meaningful effect
                 bias_q_arr[c] = 0
             else:
                 # Compute bias_q at full precision (stored as int64)
                 bq_f64 = np.float64(bias_float[c]) / denom
                 bias_q_arr[c] = int(np.round(bq_f64))
+            # Clamp to 40-bit signed range to prevent RTL PPU overflow
+            # (PPU bias register is 40-bit signed: [-2^39, 2^39-1])
+            max_bias = (1 << 39) - 1
+            if bias_q_arr[c] > max_bias:
+                bias_q_arr[c] = max_bias
+            elif bias_q_arr[c] < -max_bias - 1:
+                bias_q_arr[c] = -max_bias - 1
         else:
             bias_q_arr[c] = 0
 
@@ -1095,6 +1103,15 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 clamp_min=qmin, clamp_max=qmax,
             )
 
+            # Per-channel params: Pool uses identity requant (M=1, S=0, bias=0)
+            # since output inherits input scale. PPU still needs params per channel.
+            ch_params = []
+            for c in range(oc):
+                ch_params.append(PerChannelParam(
+                    M=1, S=0, zp=int(zp_in), bias_q=0,
+                ))
+            cfg.ch_params = ch_params
+
             print(f"    Pool[{len(npu_layers)}]: {node.op_type} "
                   f"k={kernel_shape} s={pool_strides} "
                   f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
@@ -1449,12 +1466,23 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     for cfg in npu_layers:
         op_name = op_type_names.get(cfg.op_type, 'conv')
         # Compute tiling for both modes (single/double buffer)
+        # Pool layers use pool_h/w as kernel, pool_stride as stride
+        if cfg.op_type == OP_POOLING:
+            eff_kh = cfg.pool_h
+            eff_kw = cfg.pool_w
+            eff_sh = cfg.pool_stride_h
+            eff_sw = cfg.pool_stride_w
+        else:
+            eff_kh = cfg.kernel_h
+            eff_kw = cfg.kernel_w
+            eff_sh = cfg.stride_h
+            eff_sw = cfg.stride_w
         tile_sb = compute_tiling(
             op_type=op_name,
             in_h=cfg.in_h, in_w=cfg.in_w, in_c=cfg.in_c,
             out_h=cfg.out_h, out_w=cfg.out_w, out_c=cfg.out_c,
-            kernel_h=cfg.kernel_h, kernel_w=cfg.kernel_w,
-            stride_h=cfg.stride_h, stride_w=cfg.stride_w,
+            kernel_h=eff_kh, kernel_w=eff_kw,
+            stride_h=eff_sh, stride_w=eff_sw,
             dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
             elem_size=elem_size,
             double_buffer=False,
@@ -1464,8 +1492,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             op_type=op_name,
             in_h=cfg.in_h, in_w=cfg.in_w, in_c=cfg.in_c,
             out_h=cfg.out_h, out_w=cfg.out_w, out_c=cfg.out_c,
-            kernel_h=cfg.kernel_h, kernel_w=cfg.kernel_w,
-            stride_h=cfg.stride_h, stride_w=cfg.stride_w,
+            kernel_h=eff_kh, kernel_w=eff_kw,
+            stride_h=eff_sh, stride_w=eff_sw,
             dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
             elem_size=elem_size,
             double_buffer=True,
@@ -1481,7 +1509,14 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         sb_total = sb_tiles * sb_oc_groups
         db_total = db_tiles * db_oc_groups
 
-        if db_total <= sb_total * 4:
+        # Prefer single-buffer if it fits entirely in SRAM (no tiling) —
+        # small layers run faster without DB_EN ping-pong overhead.
+        # Also prefer SB if DB causes excessive tile fragmentation (>4x).
+        sb_fits_full = (tile_sb['tile_num_h'] == 0)  # SB no-tiling = fits full SRAM
+        if sb_fits_full:
+            tile = tile_sb
+            cfg.sched_ctrl = 0
+        elif db_total <= sb_total * 4:
             # Double-buffer: acceptable tile count
             tile = tile_db
             cfg.sched_ctrl = SCHED_CTRL_DB_EN
@@ -1495,6 +1530,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         cfg.tile_w = tile['tile_w']
         cfg.tile_num_h = tile['tile_num_h']
         cfg.tile_num_w = tile['tile_num_w']
+        # Per-tile store: set when tiling says it's needed (tiled + DB_EN)
+        if tile.get('per_tile_store_en', False):
+            cfg.sched_ctrl |= SCHED_CTRL_PER_TILE_STORE
         if tile['tile_num_h'] > 0:
             tiled_count += 1
     print(f"\n=== Tiling: {tiled_count}/{len(npu_layers)} layers need tiling ===")

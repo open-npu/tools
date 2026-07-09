@@ -15,7 +15,7 @@ from dataclasses import dataclass
 class HWConfig:
     """NPU hardware configuration (all dimensions freely configurable)."""
     array_size: int = 16         # Systolic array dimension (N×N)
-    act_bank_size: int = 32768   # Bytes per activation bank (ping-pong: 2 banks)
+    act_bank_size: int = 24576   # Bytes per activation bank (SPAD_KB=192 → ACT_DEPTH=12288w, bank=6144w=24576B)
     weight_buf_size: int = 65536 # Bytes for weight buffer
     param_sram_max_ch: int = 512 # Max output channels per param tile (= param_sram / 14)
     dw_parallel_ch: int = 16     # DW conv parallel channels (typically = array_size)

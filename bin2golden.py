@@ -148,6 +148,10 @@ def read_npu1(path):
 def elem_bytes(layer):
     return 2 if layer.data_type == 1 else 1
 
+def is_per_tile_store(layer):
+    """Check if layer uses per-tile store (SCHED_CTRL bit[4])."""
+    return bool(layer.sched_ctrl & 0x10)  # SCHED_CTRL_PER_TILE_STORE = bit[4]
+
 def n_full_input_words(layer):
     """Full tensor input words (NOT tile)."""
     eb = elem_bytes(layer)
@@ -159,23 +163,41 @@ def n_input_words(layer):
     eb = elem_bytes(layer)
     if layer.tile_h > 0 and layer.tile_w > 0:
         # Tiled: compute input tile size (with halo for kernel overlap)
-        inp_h = (layer.tile_h - 1) * layer.stride_h + layer.kernel_h
-        inp_w = (layer.tile_w - 1) * layer.stride_w + layer.kernel_w
+        # Pool layers use pool_h/w and pool_stride, not kernel_h/w
+        if hasattr(layer, 'op_type') and layer.op_type == 3:  # OP_POOLING
+            kh = layer.pool_h
+            kw = layer.pool_w
+            sh = layer.pool_stride_h
+            sw = layer.pool_stride_w
+        else:
+            kh = layer.kernel_h
+            kw = layer.kernel_w
+            sh = layer.stride_h
+            sw = layer.stride_w
+        inp_h = (layer.tile_h - 1) * sh + kh
+        inp_w = (layer.tile_w - 1) * sw + kw
         total = inp_h * inp_w * layer.in_c * eb
     else:
         total = layer.in_h * layer.in_w * layer.in_c * eb
     return (total + 3) // 4  # round up to word
 
-def n_output_words(layer):
-    """Output words for DMA store.
-    
-    For tiled layers, the RTL stores only the LAST tile's output to DDR.
-    Use the last tile dimensions (which may be clipped at borders).
-    For non-tiled layers, uses the full output tensor.
+def n_output_words(layer, per_tile_store=None):
+    """Output words for DMA store / golden comparison.
+
+    For per_tile_store=True (cascaded tiled inference): RTL stores every tile
+    to NHWC DDR, so golden output is the FULL output tensor.
+    For per_tile_store=False (last-tile-only): RTL stores only the LAST tile.
+    For non-tiled layers: always full output tensor.
+    If per_tile_store is None, auto-detect from layer.sched_ctrl bit[4].
     """
+    if per_tile_store is None:
+        per_tile_store = is_per_tile_store(layer)
     eb = elem_bytes(layer)
-    if layer.tile_h > 0 and layer.tile_w > 0:
-        # Last tile (tile_num_h-1, tile_num_w-1) may be clipped at image border
+    if per_tile_store and layer.tile_h > 0 and layer.tile_w > 0:
+        # Per-tile store: full output stored to NHWC DDR across all tiles
+        total = layer.out_h * layer.out_w * layer.out_c * eb
+    elif layer.tile_h > 0 and layer.tile_w > 0:
+        # Last-tile-only store: last tile dimensions (clipped at border)
         last_h = min(layer.tile_h, layer.out_h - (layer.tile_num_h - 1) * layer.tile_h)
         last_w = min(layer.tile_w, layer.out_w - (layer.tile_num_w - 1) * layer.tile_w)
         total = last_h * last_w * layer.out_c * eb
@@ -186,8 +208,10 @@ def n_output_words(layer):
 def dma_in_size(layer):
     return n_full_input_words(layer) * 4
 
-def dma_out_size(layer):
-    return n_output_words(layer) * 4
+def dma_out_size(layer, per_tile_store=None):
+    if per_tile_store is None:
+        per_tile_store = is_per_tile_store(layer)
+    return n_output_words(layer, per_tile_store) * 4
 
 def n_wgt_words(layer):
     """Compute weight word count from layer config."""
@@ -289,15 +313,26 @@ def pack_input_to_words(input_nhwc, layer, pad_value=0):
     # Tiled: extract per-tile input regions with halo, pack sequentially
     # Input: NHWC tensor of shape (in_h, in_w, in_c)
     H, W, C = input_nhwc.shape
-    
+
     # Compute input tile size with halo
-    inp_h = (layer.tile_h - 1) * layer.stride_h + layer.kernel_h
-    inp_w = (layer.tile_w - 1) * layer.stride_w + layer.kernel_w
+    # Pool layers use pool_h/w and pool_stride, not kernel_h/w
+    if hasattr(layer, 'op_type') and layer.op_type == 3:  # OP_POOLING
+        kh = layer.pool_h
+        kw = layer.pool_w
+        sh = layer.pool_stride_h
+        sw = layer.pool_stride_w
+    else:
+        kh = layer.kernel_h
+        kw = layer.kernel_w
+        sh = layer.stride_h
+        sw = layer.stride_w
+    inp_h = (layer.tile_h - 1) * sh + kh
+    inp_w = (layer.tile_w - 1) * sw + kw
     
     # Compute actual padded dimensions needed for ALL tiles
     # The rightmost/bottom tiles may need more padding than pad_r/pad_b
-    max_row_end = (layer.tile_num_h - 1) * layer.stride_h * layer.tile_h + inp_h
-    max_col_end = (layer.tile_num_w - 1) * layer.stride_w * layer.tile_w + inp_w
+    max_row_end = (layer.tile_num_h - 1) * sh * layer.tile_h + inp_h
+    max_col_end = (layer.tile_num_w - 1) * sw * layer.tile_w + inp_w
     pad_t, pad_l = layer.pad_top, layer.pad_left
     # Oversized padding to accommodate all tile windows
     pad_b_extra = max(0, max_row_end - (H + pad_t))
@@ -312,9 +347,9 @@ def pack_input_to_words(input_nhwc, layer, pad_value=0):
     for ty in range(layer.tile_num_h):
         for tx in range(layer.tile_num_w):
             # Input tile region in padded image
-            row_start = ty * layer.tile_h * layer.stride_h
+            row_start = ty * layer.tile_h * sh
             row_end = row_start + inp_h
-            col_start = tx * layer.tile_w * layer.stride_w
+            col_start = tx * layer.tile_w * sw
             col_end = col_start + inp_w
             tile_data = padded[row_start:row_end, col_start:col_end, :]
             all_words.append(pack_flat(tile_data.flatten()))
@@ -322,9 +357,50 @@ def pack_input_to_words(input_nhwc, layer, pad_value=0):
     return np.concatenate(all_words) if all_words else pack_flat(input_nhwc.flatten())
 
 
-def pack_output_to_words(output_nhwc, layer):
-    """Pack output NHWC tensor into uint32 words (same as input)."""
-    return pack_input_to_words(output_nhwc, layer)
+def pack_output_to_words(output_nhwc, layer, per_tile_store=None):
+    """Pack output NHWC tensor into uint32 words.
+
+    For per_tile_store=True: RTL stores each tile to NHWC DDR layout.
+      Golden output is the FULL NHWC tensor (packed as contiguous NHWC).
+    For per_tile_store=False (default):
+      - Non-tiled: full NHWC output.
+      - Tiled: LAST tile only (RTL stores only last tile to DDR).
+    If per_tile_store is None, auto-detect from layer.sched_ctrl bit[4].
+    """
+    if per_tile_store is None:
+        per_tile_store = is_per_tile_store(layer)
+
+    eb = elem_bytes(layer)
+    if eb == 1:
+        def pack_flat(flat):
+            n_words = (len(flat) + 3) // 4
+            padded = np.zeros(n_words * 4, dtype=np.uint8)
+            padded[:len(flat)] = flat.astype(np.uint8) & 0xFF
+            return padded.view('<u4')
+    else:
+        def pack_flat(flat):
+            flat_u16 = flat.astype(np.uint16)
+            n_words = (len(flat_u16) + 1) // 2
+            padded = np.zeros(n_words * 2, dtype=np.uint16)
+            padded[:len(flat_u16)] = flat_u16
+            return padded.view('<u4')
+
+    # Per-tile store: golden is full NHWC output (RTL writes tiles to NHWC DDR)
+    if per_tile_store:
+        return pack_flat(output_nhwc.flatten())
+
+    # Non-tiled: full NHWC output
+    if layer.tile_h == 0 or layer.tile_w == 0:
+        return pack_flat(output_nhwc.flatten())
+
+    # Tiled, last-tile-only store: pack only the last tile's output region
+    last_h = min(layer.tile_h, layer.out_h - (layer.tile_num_h - 1) * layer.tile_h)
+    last_w = min(layer.tile_w, layer.out_w - (layer.tile_num_w - 1) * layer.tile_w)
+    row_start = (layer.tile_num_h - 1) * layer.tile_h
+    col_start = (layer.tile_num_w - 1) * layer.tile_w
+    tile_data = output_nhwc[row_start:row_start + last_h,
+                           col_start:col_start + last_w, :]
+    return pack_flat(tile_data.flatten())
 
 
 # ─── Golden generation ───
@@ -347,19 +423,43 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
     ddr_addr = base_ddr_addr
 
     for idx, layer in enumerate(layers):
+        pts = is_per_tile_store(layer)  # per-tile store flag
         n_in = n_input_words(layer)
-        n_out = n_output_words(layer)
+        n_out = n_output_words(layer, pts)
         n_wgt = n_wgt_words(layer)
         n_prm = n_param_words(layer)
+        # Add/Concat layers use global params (2 words) not counted in ch_params
+        if layer.op_type == OP_ELTWISE_ADD and n_prm == 0:
+            n_prm = 2
 
-        # DDR addresses
+        # DDR input region: for tiled layers, the full tiled input is
+        # tile_in_size * num_tiles (each tile's input packed sequentially).
+        # For non-tiled, it's n_input_words * 4.
+        if layer.tile_h > 0 and layer.tile_w > 0:
+            num_tiles = layer.tile_num_h * layer.tile_num_w
+            in_size = n_in * 4 * num_tiles
+        else:
+            in_size = n_in * 4
+        wgt_size = n_wgt * 4
+        param_size = n_prm * 4
+        out_size = dma_out_size(layer, pts)
+        align = 4096
+        in_size_align = ((in_size + align - 1) // align) * align
+        wgt_size_align = ((wgt_size + align - 1) // align) * align
+        param_size_align = ((param_size + align - 1) // align) * align
+        out_size_align = ((out_size + align - 1) // align) * align
+
+        # DDR addresses — dynamically sized to avoid overlap
+        # Note: wgt_addr must differ from param_addr even when wgt_size=0,
+        # because dma_bank_sel compares ext_addr to wgt_addr/param_addr.
+        # If they're equal, param loads get misrouted to weight SRAM.
         ddr_in_addr = ddr_addr
-        ddr_out_addr = ddr_addr + layer_offset
-        ddr_wgt_addr = ddr_out_addr + layer_offset
-        ddr_param_addr = ddr_wgt_addr + layer_offset
+        ddr_wgt_addr = ddr_in_addr + in_size_align
+        ddr_param_addr = ddr_wgt_addr + (wgt_size_align if wgt_size_align > 0 else align)
+        ddr_out_addr = ddr_param_addr + param_size_align
 
-        # Advance DDR address for next layer
-        ddr_addr += layer_offset * 4  # 4 address slots per layer
+        # Advance DDR address for next layer (after this layer's output)
+        ddr_addr = ddr_out_addr + out_size_align
 
         # Pooling config
         pool_mode_map = {0: 0, 1: 1}  # max=0, avg=1
@@ -424,9 +524,15 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
             'concat_cfg': concat_cfg,
             'dma_in_size': dma_in_size(layer),
             'dma_wgt_size': n_wgt_words(layer) * 4,
-            'dma_out_size': dma_out_size(layer),
+            'dma_out_size': dma_out_size(layer, pts),
             'dma_param_count': len(layer.ch_params),
             'tile_in_size': n_input_words(layer) * 4 if layer.tile_h > 0 else 0,
+            # Per-tile store (2D DMA for NHWC DDR layout)
+            'tile_out_size': (layer.tile_h * layer.tile_w * layer.out_c *
+                              elem_bytes(layer)) if (pts and layer.tile_h > 0) else 0,
+            'store_mode': 1 if pts else 0,  # bit[0]=PER_TILE_STORE_EN
+            'row_cfg': (((layer.tile_h & 0xFFFF) << 16) | ((layer.tile_w * layer.out_c *
+                        elem_bytes(layer) // 4) & 0xFFFF)) if pts else 0,
             'n_input_words': n_in,
             'n_output_words': n_out,
             'tile_h': layer.tile_h,
@@ -458,6 +564,13 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
         # Save .npy files
         wgt_words = extract_layer_weights(layers, weight_blob, idx)
         prm_words = pack_params_to_words(layer)
+        # For Add/Concat layers: append global Add params (2 words: M_A|S_A, M_B|S_B)
+        if layer.add_params and len(prm_words) == 0:
+            ap = layer.add_params
+            w_a = (ap.M_A & 0x7FFF) | ((ap.S_A & 0x3F) << 16)
+            w_b = (ap.M_B & 0x7FFF) | ((ap.S_B & 0x3F) << 16)
+            prm_words = np.array([w_a, w_b], dtype=np.uint32)
+            meta['dma_param_count'] = 2
 
         # Input: for layer 0 use provided input; for later layers use previous output
         # (We'll handle this in the test, just save placeholder for now)
