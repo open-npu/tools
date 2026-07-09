@@ -49,10 +49,11 @@ POST_BIAS_EN = (1 << 6)
 POST_INT16_OUT = (1 << 7)
 
 # SCHED_CTRL bits (model descriptor scheduling, NOT HW DMA_CTRL CSR)
-SCHED_CTRL_DB_EN      = (1 << 0)   # bit[0]: double-buffer enable
-SCHED_CTRL_FUSE_START = (1 << 1)   # bit[1]: first layer of fused block
-SCHED_CTRL_FUSE_MID   = (1 << 2)   # bit[2]: middle layer of fused block
-SCHED_CTRL_FUSE_END   = (1 << 3)   # bit[3]: last layer of fused block
+SCHED_CTRL_DB_EN          = (1 << 0)   # bit[0]: double-buffer enable
+SCHED_CTRL_FUSE_START     = (1 << 1)   # bit[1]: first layer of fused block
+SCHED_CTRL_FUSE_MID       = (1 << 2)   # bit[2]: middle layer of fused block
+SCHED_CTRL_FUSE_END       = (1 << 3)   # bit[3]: last layer of fused block
+SCHED_CTRL_PER_TILE_STORE = (1 << 4)   # bit[4]: per-tile store to NHWC DDR (cascaded inference)
 
 
 @dataclass

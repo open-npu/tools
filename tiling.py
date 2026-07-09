@@ -29,8 +29,12 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         profile: HWProfile instance (default: NPU_FULL)
 
     Returns:
-        dict with keys: tile_h, tile_w, tile_num_h, tile_num_w, tile_oc
+        dict with keys: tile_h, tile_w, tile_num_h, tile_num_w, tile_oc,
+              per_tile_store_en
               (tile_h/w = 0 and tile_num_h/w = 0 means no tiling needed)
+              per_tile_store_en: True when per-tile store to NHWC DDR is needed
+                  (tiled + double-buffer, for cascaded model inference).
+                  False for small layers (full SRAM) or single-buffer tiled.
     """
     if profile is None:
         profile = DEFAULT_HW
@@ -42,7 +46,8 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
 
     # FC and Concat don't do spatial tiling
     if op_type in ('fc', 'concat'):
-        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0, 'tile_oc': out_c}
+        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
+                'tile_oc': out_c, 'per_tile_store_en': False}
 
     # Effective kernel size (with dilation)
     kh_eff = (kernel_h - 1) * dilation_h + 1
@@ -69,11 +74,17 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     full_output_size = out_h * out_w * out_c * elem_size
     full_weight_size = kernel_h * kernel_w * in_c * out_c * elem_size if op_type == 'conv' else 0
 
-    if (full_input_size <= act_bank and
-        full_output_size <= act_bank and
+    # In DB_EN mode, input (at SRAM offset 0) and output (at offset tile_in_words)
+    # coexist in the same bank, so their sum must fit. In non-DB mode, the input
+    # is overwritten by output during compute, so they need only fit individually.
+    coexist_ok = (full_input_size + full_output_size <= act_bank) if double_buffer \
+                 else (full_input_size <= act_bank and full_output_size <= act_bank)
+    if (coexist_ok and
         full_weight_size <= weight_buf):
-        # No tiling needed
-        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0, 'tile_oc': out_c}
+        # No tiling needed — small layer fits entirely in SRAM
+        # per_tile_store_en=False: single store at layer end (full output)
+        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
+                'tile_oc': out_c, 'per_tile_store_en': False}
 
     # Search for optimal output tile size
     # Strategy: maximize tile area while preferring square-ish tiles
@@ -104,6 +115,11 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
             if in_tile_size > act_bank:
                 break  # tile_w only grows, so break inner loop
 
+            # DB_EN: input (offset 0) and output (offset tile_in_words) coexist
+            # in the same bank — their sum must fit.
+            if double_buffer and (in_tile_size + out_tile_size) > act_bank:
+                break  # tile_w only grows, so break inner loop
+
             # This tile is valid. Prefer larger area; tie-break by squareness.
             area = tile_h * tile_w
             if area > best_area or (area == best_area and
@@ -123,14 +139,18 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     # If only 1 tile in each direction and it covers the full output,
     # no tiling needed (just direct compute)
     if tile_num_h == 1 and tile_num_w == 1 and tile_oc == out_c:
-        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0, 'tile_oc': out_c}
+        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
+                'tile_oc': out_c, 'per_tile_store_en': False}
 
+    # Tiled layer: per_tile_store_en only for double-buffer mode (cascaded inference)
+    # Single-buffer tiled layers keep last-tile-only store (no cascade)
     return {
         'tile_h': tile_h,
         'tile_w': tile_w,
         'tile_num_h': tile_num_h,
         'tile_num_w': tile_num_w,
         'tile_oc': tile_oc,
+        'per_tile_store_en': double_buffer,
     }
 
 
