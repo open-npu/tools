@@ -206,6 +206,9 @@ def n_output_words(layer, per_tile_store=None):
     return (total + 3) // 4
 
 def dma_in_size(layer):
+    if layer.tile_h > 0 and layer.tile_w > 0:
+        num_tiles = layer.tile_num_h * layer.tile_num_w
+        return n_input_words(layer) * 4 * num_tiles
     return n_full_input_words(layer) * 4
 
 def dma_out_size(layer, per_tile_store=None):

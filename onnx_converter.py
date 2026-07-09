@@ -1516,15 +1516,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         if sb_fits_full:
             tile = tile_sb
             cfg.sched_ctrl = 0
-        elif db_total <= sb_total * 4:
-            # Double-buffer: acceptable tile count
+        else:
+            # Tiled: must use DB_EN + PTS (SB tiled can't fit full input in SRAM)
             tile = tile_db
             cfg.sched_ctrl = SCHED_CTRL_DB_EN
-            db_count += 1
-        else:
-            # Single-buffer: DB fragmentation too severe
-            tile = tile_sb
-            cfg.sched_ctrl = 0
 
         cfg.tile_h = tile['tile_h']
         cfg.tile_w = tile['tile_w']
