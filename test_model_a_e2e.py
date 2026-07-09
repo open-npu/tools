@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 3: M110 Full Model End-to-End Validation
+Phase 3: MODEL_A Full Model End-to-End Validation
 
 Validates the entire toolchain (calibration → conversion → csim inference)
-on M110.onnx — a 63-layer MobileNetV2-style face embedding network.
+on MODEL_A.onnx — a 63-layer MobileNetV2-style face embedding network.
 
 Metrics:
   - Cosine similarity between ORT float32 and csim INT8 outputs
@@ -24,14 +24,14 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from onnx_converter import convert_model
 
-MODEL_PATH = '/data/sam/onnx_quant/M110.onnx'
+MODEL_PATH = '/data/sam/onnx_quant/MODEL_A.onnx'
 CALIB_DIR = '/data/sam/onnx_quant/a3_test_images'
 CSIM_PATH = '/data/sam/open-npu/csim/npu_sim'
-OUTPUT_DIR = '/tmp/m110_e2e_phase3'
+OUTPUT_DIR = '/tmp/model_a_e2e_phase3'
 
 
 def setup():
-    """Convert M110 model once for all tests."""
+    """Convert MODEL_A model once for all tests."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     model_bin = os.path.join(OUTPUT_DIR, 'model.npu1.bin')
@@ -46,7 +46,7 @@ def setup():
     input_bin = os.path.join(OUTPUT_DIR, 'input.bin')
     arr.tofile(input_bin)
 
-    print("=== Converting M110 model ===")
+    print("=== Converting MODEL_A model ===")
     convert_model(MODEL_PATH, CALIB_DIR, input_bin, model_bin,
                   input_format='int8-nchw', num_calib=50, bits=8)
     return model_bin
@@ -254,7 +254,7 @@ def main():
 
     # Summary
     print(f"\n{'='*60}")
-    print("M110 E2E VALIDATION SUMMARY")
+    print("MODEL_A E2E VALIDATION SUMMARY")
     print(f"{'='*60}")
     all_pass = True
     for name, passed in results:
@@ -264,7 +264,7 @@ def main():
             all_pass = False
 
     if all_pass:
-        print("\nM110 Phase 3 validation PASSED!")
+        print("\nMODEL_A Phase 3 validation PASSED!")
     else:
         print("\nSome tests FAILED!")
     return all_pass

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-gen_ir624_int16_golden.py — Regenerate RTL golden data for IR624 INT16 model.
+gen_model_b_int16_golden.py — Regenerate RTL golden data for MODEL_B INT16 model.
 
 Re-runs onnx_converter (with fixed tiling.py), then drives CSIM layer-by-layer
 to produce bit-exact per-layer golden outputs, including Add-layer residual
 inputs (input_b). Output mirrors the format consumed by
-rtl/tb/e2e/test_ir624_int16_e2e.py via load_golden('ir624_int16').
+rtl/tb/e2e/test_model_b_int16_e2e.py via load_golden('model_b_int16').
 
 Usage:
-  python3 gen_ir624_int16_golden.py
+  python3 gen_model_b_int16_golden.py
 
 Output:
-  rtl/tb/golden/golden_dma_e2e/ir624_int16/
+  rtl/tb/golden/golden_dma_e2e/model_b_int16/
     metadata.json
     layer_XX_wgt.npy
     layer_XX_param.npy
@@ -73,13 +73,13 @@ def pack_last_tile_output(output_nhwc, layer):
         return padded.view('<u4')
 
 # ─── Paths ───
-MODEL_PATH = '/data/sam/ir624/WXPay_PalmIrLiveness_624_06_r20260509.onnx'
-CALIB_DIR = '/data/sam/ir624/O2_for_guopeng20221209/O2_quant_datas'
-INPUT_BIN = '/data/sam/ir624/debug.bin'
+MODEL_PATH = '/data/sam/model_b/WXPay_PalmIrLiveness_624_06_r20260509.onnx'
+CALIB_DIR = '/data/sam/model_b/O2_for_guopeng20221209/O2_quant_datas'
+INPUT_BIN = '/data/sam/model_b/debug.bin'
 CSIM_PATH = os.path.join(os.path.dirname(TOOLS), 'csim', 'npu_sim')
-WORK_DIR = '/tmp/ir624_int16_golden'
+WORK_DIR = '/tmp/model_b_int16_golden'
 GOLDEN_OUT = os.path.join(os.path.dirname(TOOLS), 'rtl', 'tb', 'golden',
-                          'golden_dma_e2e', 'ir624_int16')
+                          'golden_dma_e2e', 'model_b_int16')
 NUM_CALIB = 100
 
 
@@ -166,7 +166,7 @@ def main():
 
     # ─── Step 1: Convert model (with fixed tiling) ───
     print("=" * 60)
-    print("Step 1: Convert IR624 model (INT16, fixed tiling)")
+    print("Step 1: Convert MODEL_B model (INT16, fixed tiling)")
     print("=" * 60)
     convert_model(MODEL_PATH, CALIB_DIR, INPUT_BIN, model_bin,
                   input_format='int8-nchw', num_calib=NUM_CALIB, bits=16)

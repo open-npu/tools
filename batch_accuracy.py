@@ -7,7 +7,7 @@ both ONNX Runtime (float32 reference) and NPU C-sim (quantized).
 Reports per-image and average cosine similarity.
 
 Usage:
-  python3 batch_accuracy.py --model M110.onnx --calib CALIB_DIR \
+  python3 batch_accuracy.py --model MODEL_A.onnx --calib CALIB_DIR \
       --images TEST_DIR --num-images 20
 
 SPDX-License-Identifier: Apache-2.0

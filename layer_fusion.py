@@ -340,8 +340,8 @@ def estimate_fusion_savings(block: FusedBlock, tiling: FusedTiling,
 
 # ─── Self-Test ───
 
-def _m110_layers():
-    """M110 MobileNetV2-style layer list for testing (simplified)."""
+def _model_a_layers():
+    """MODEL_A MobileNetV2-style layer list for testing (simplified)."""
 
     @dataclass
     class L:
@@ -447,11 +447,11 @@ if __name__ == '__main__':
     print("Open-NPU Layer Fusion: Block Detection & Fused Tiling Calculator")
     print("=" * 70)
 
-    # ─── Test 1: M110 MobileNetV2 ───
-    print("\n--- M110 (MobileNetV2-style, 63 layers) ---")
-    m110 = _m110_layers()
-    blocks = detect_fusible_blocks(m110)
-    print(f"  Total layers: {len(m110)}")
+    # ─── Test 1: MODEL_A MobileNetV2 ───
+    print("\n--- MODEL_A (MobileNetV2-style, 63 layers) ---")
+    model_a = _model_a_layers()
+    blocks = detect_fusible_blocks(model_a)
+    print(f"  Total layers: {len(model_a)}")
     print(f"  Detected fusible blocks: {len(blocks)}")
 
     total_unfused_dma = 0

@@ -5,11 +5,11 @@ INT16 End-to-End Precision Validation
 Validates the INT16 quantization path through the full toolchain:
   ONNX float32 → INT16 PTQ conversion → csim inference → cosine comparison
 
-Tests both M110 (63-layer face embedding) and ResNet-18 (31-layer classification)
+Tests both MODEL_A (63-layer face embedding) and ResNet-18 (31-layer classification)
 to verify INT16 provides near-lossless precision compared to FP32.
 
 Expected results:
-  - M110 INT16 cosine vs FP32: >= 0.999 (vs INT8 ~0.975)
+  - MODEL_A INT16 cosine vs FP32: >= 0.999 (vs INT8 ~0.975)
   - ResNet-18 INT16 cosine vs FP32: >= 0.998 (vs INT8 ~0.998)
 
 SPDX-License-Identifier: Apache-2.0
@@ -27,7 +27,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from onnx_converter import convert_model
 
-MODEL_PATH = '/data/sam/onnx_quant/M110.onnx'
+MODEL_PATH = '/data/sam/onnx_quant/MODEL_A.onnx'
 CALIB_DIR = '/data/sam/onnx_quant/a3_test_images'
 CSIM_PATH = '/data/sam/open-npu/csim/npu_sim'
 OUTPUT_DIR = '/tmp/int16_e2e_test'
@@ -76,22 +76,22 @@ def quantize_input(img_path, in_scale, bits=16):
     return input_q
 
 
-def setup_m110():
-    """Convert M110 model in both INT8 and INT16 modes."""
-    m110_dir = os.path.join(OUTPUT_DIR, 'm110')
-    os.makedirs(m110_dir, exist_ok=True)
+def setup_model_a():
+    """Convert MODEL_A model in both INT8 and INT16 modes."""
+    model_a_dir = os.path.join(OUTPUT_DIR, 'model_a')
+    os.makedirs(model_a_dir, exist_ok=True)
 
     all_imgs = sorted(glob.glob(os.path.join(CALIB_DIR, '*.jpg')))
     img = Image.open(all_imgs[0]).resize((224, 224))
     arr = np.array(img).transpose(2, 0, 1).astype(np.uint8)
-    input_bin = os.path.join(m110_dir, 'input.bin')
+    input_bin = os.path.join(model_a_dir, 'input.bin')
     arr.tofile(input_bin)
 
     models = {}
     for bits in (8, 16):
-        model_bin = os.path.join(m110_dir, f'model_int{bits}.npu1.bin')
+        model_bin = os.path.join(model_a_dir, f'model_int{bits}.npu1.bin')
         if not os.path.exists(model_bin):
-            print(f"  Converting M110 INT{bits}...")
+            print(f"  Converting MODEL_A INT{bits}...")
             convert_model(MODEL_PATH, CALIB_DIR, input_bin, model_bin,
                           input_format='int8-nchw', num_calib=50, bits=bits)
         models[bits] = model_bin
@@ -132,17 +132,17 @@ def setup_resnet18():
     return model_path, calib_dir, test_path
 
 
-def test_m110_int16(num_images=10):
-    """Test M110 INT16 precision across multiple images."""
+def test_model_a_int16(num_images=10):
+    """Test MODEL_A INT16 precision across multiple images."""
     print(f"\n{'='*60}")
-    print("Test 1: M110 INT16 vs FP32 (face embedding, 63 layers)")
+    print("Test 1: MODEL_A INT16 vs FP32 (face embedding, 63 layers)")
     print(f"{'='*60}")
 
     if not os.path.exists(MODEL_PATH):
-        print("  SKIP: M110 model not available")
+        print("  SKIP: MODEL_A model not available")
         return None
 
-    models = setup_m110()
+    models = setup_model_a()
 
     sess = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     input_name = sess.get_inputs()[0].name
@@ -265,14 +265,14 @@ def test_resnet18_int16():
 def test_int16_output_distribution():
     """Test 3: Verify INT16 output uses the full dynamic range well."""
     print(f"\n{'='*60}")
-    print("Test 3: INT16 output distribution (M110)")
+    print("Test 3: INT16 output distribution (MODEL_A)")
     print(f"{'='*60}")
 
     if not os.path.exists(MODEL_PATH):
-        print("  SKIP: M110 model not available")
+        print("  SKIP: MODEL_A model not available")
         return None
 
-    models = setup_m110()
+    models = setup_model_a()
     meta16 = np.load(models[16].replace('.bin', '_meta.npz'))
     in_scale_16 = float(meta16['input_scale'])
 
@@ -323,10 +323,10 @@ def test_model_size():
     print(f"{'='*60}")
 
     if not os.path.exists(MODEL_PATH):
-        print("  SKIP: M110 model not available")
+        print("  SKIP: MODEL_A model not available")
         return None
 
-    models = setup_m110()
+    models = setup_model_a()
     size8 = os.path.getsize(models[8])
     size16 = os.path.getsize(models[16])
     ratio = size16 / size8
@@ -352,7 +352,7 @@ def main():
     print("Open-NPU INT16 End-to-End Precision Validation")
     print("=" * 60)
     print(f"  csim: {CSIM_PATH}")
-    print(f"  M110: {MODEL_PATH}")
+    print(f"  MODEL_A: {MODEL_PATH}")
     print(f"  Output: {OUTPUT_DIR}")
 
     if not os.path.exists(CSIM_PATH):
@@ -362,10 +362,10 @@ def main():
 
     results = []
 
-    # Test 1: M110 multi-image precision
-    r = test_m110_int16(num_images=10)
+    # Test 1: MODEL_A multi-image precision
+    r = test_model_a_int16(num_images=10)
     if r is not None:
-        results.append(('M110 INT16 cosine >= 0.999', r))
+        results.append(('MODEL_A INT16 cosine >= 0.999', r))
 
     # Test 2: ResNet-18 INT16 precision
     r = test_resnet18_int16()

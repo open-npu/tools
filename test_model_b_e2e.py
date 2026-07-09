@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IR624 Real Model End-to-End Validation
+MODEL_B Real Model End-to-End Validation
 
 Validates the full NPU toolchain on a real-world IR palm liveness model:
   - Input: 112x112x1 grayscale IR image
@@ -9,9 +9,9 @@ Validates the full NPU toolchain on a real-world IR palm liveness model:
           if cos < 0.99, retry with INT16
 
 Model: WXPay_PalmIrLiveness_624_06
-ONNX: /data/sam/ir624/WXPay_PalmIrLiveness_624_06_r20260509.onnx
-Calibration: /data/sam/ir624/O2_for_guopeng20221209/O2_quant_datas/ (1002 JPGs)
-Test input: /data/sam/ir624/debug.bin (uint8, 112x112x1)
+ONNX: /data/sam/model_b/WXPay_PalmIrLiveness_624_06_r20260509.onnx
+Calibration: /data/sam/model_b/O2_for_guopeng20221209/O2_quant_datas/ (1002 JPGs)
+Test input: /data/sam/model_b/debug.bin (uint8, 112x112x1)
 
 Success criteria: cosine similarity >= 0.99
 
@@ -27,11 +27,11 @@ import onnxruntime as ort
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from onnx_converter import convert_model
 
-MODEL_PATH = '/data/sam/ir624/WXPay_PalmIrLiveness_624_06_r20260509.onnx'
-CALIB_DIR = '/data/sam/ir624/O2_for_guopeng20221209/O2_quant_datas'
-INPUT_BIN = '/data/sam/ir624/debug.bin'
+MODEL_PATH = '/data/sam/model_b/WXPay_PalmIrLiveness_624_06_r20260509.onnx'
+CALIB_DIR = '/data/sam/model_b/O2_for_guopeng20221209/O2_quant_datas'
+INPUT_BIN = '/data/sam/model_b/debug.bin'
 CSIM_PATH = '/data/sam/open-npu/csim/npu_sim'
-OUTPUT_DIR = '/tmp/ir624_e2e'
+OUTPUT_DIR = '/tmp/model_b_e2e'
 COS_THRESHOLD = 0.99
 NUM_CALIB = 100  # use 100 images for calibration
 
@@ -159,7 +159,7 @@ def main():
 
     # Summary
     print("\n" + "=" * 60)
-    print("IR624 E2E VALIDATION SUMMARY")
+    print("MODEL_B E2E VALIDATION SUMMARY")
     print("=" * 60)
     print(f"  Model: {os.path.basename(MODEL_PATH)}")
     print(f"  Input: 112x112x1 grayscale (debug.bin)")

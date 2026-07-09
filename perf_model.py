@@ -680,10 +680,10 @@ def run_perf_model_with_fusion(layers, hw):
     return results, blocks
 
 
-# ─── Built-in M110 MobileNetV2 ───
+# ─── Built-in MODEL_A MobileNetV2 ───
 
-def m110_layers():
-    """M110 MobileNetV2-style face embedding (63 layers)."""
+def model_a_layers():
+    """MODEL_A MobileNetV2-style face embedding (63 layers)."""
     L = LayerDesc
     layers = [
         L('conv', 224, 224, 3, 112, 112, 56, kernel_h=3, kernel_w=3, stride_h=2, stride_w=2),
@@ -783,8 +783,8 @@ def main():
     parser = argparse.ArgumentParser(description='Open-NPU Performance Estimator')
     parser.add_argument('--resnet18-test', action='store_true',
                         help='Run built-in ResNet-18 half-width test')
-    parser.add_argument('--m110-test', action='store_true',
-                        help='Run built-in M110 MobileNetV2 test')
+    parser.add_argument('--model_a-test', action='store_true',
+                        help='Run built-in MODEL_A MobileNetV2 test')
     parser.add_argument('--bits', type=int, default=8, choices=[8, 16],
                         help='Data type: 8=INT8, 16=INT16 (default: 8)')
     parser.add_argument('--no-double-buffer', action='store_true',
@@ -800,13 +800,13 @@ def main():
 
     hw_cfg = hw_config_from_args(args)
 
-    if not args.resnet18_test and not args.m110_test:
-        print("Usage: python3 perf_model.py --resnet18-test|--m110-test [--bits 8|16] [--bw 4] [--compare] [--fusion]")
+    if not args.resnet18_test and not args.model_a_test:
+        print("Usage: python3 perf_model.py --resnet18-test|--model_a-test [--bits 8|16] [--bw 4] [--compare] [--fusion]")
         return
 
-    if args.m110_test:
-        layers = m110_layers()
-        model_name = "M110 MobileNetV2"
+    if args.model_a_test:
+        layers = model_a_layers()
+        model_name = "MODEL_A MobileNetV2"
     else:
         layers = resnet18_layers()
         model_name = "ResNet-18 Half-Width"
