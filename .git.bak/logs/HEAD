@@ -1,0 +1,32 @@
+0000000000000000000000000000000000000000 9c63093a7ee1ba19bab1270e9000fc4f1b914142 Sam <sam@open-npu.dev> 1779183448 +0000	commit (initial): Quantization tools: INT8/INT16 precision verification suite
+9c63093a7ee1ba19bab1270e9000fc4f1b914142 df32a1893048fee05ab23bf2db9b99bb9bfbcb76 Sam <sam@open-npu.dev> 1779260905 +0000	commit: upgrade model_packer to NPU1 format (per-channel requantize)
+df32a1893048fee05ab23bf2db9b99bb9bfbcb76 c7c65248864243e327c2e97e8812ced11ab3ea9e Sam <sam@open-npu.dev> 1779274941 +0000	commit: fix(int16): expand bias_q to int64, fix M/S search range and calibration
+c7c65248864243e327c2e97e8812ced11ab3ea9e b25b8616d7f2227537874d4d1599dc7bec850919 Sam <sam@open-npu.dev> 1779277737 +0000	commit: feat(converter): add ONNX Clip(0,6) → ReLU6 fusion support
+b25b8616d7f2227537874d4d1599dc7bec850919 476d990ee967bb91b494fa54fadb73273375afdb Sam <sam@open-npu.dev> 1779277744 +0000	commit: feat(tools): add batch accuracy comparison script (INT8 vs INT16)
+476d990ee967bb91b494fa54fadb73273375afdb 0bea92ff770cb8e3a7cfc44948de9d48afa1cd7c Sam <sam@open-npu.dev> 1779281873 +0000	commit: feat(converter): add BatchNorm fold + Pooling support (Phase 2)
+0bea92ff770cb8e3a7cfc44948de9d48afa1cd7c 6bd1f062e3a1fdedf2cbbab7a6b2fe3e946bcf44 Sam <sam@open-npu.dev> 1779329126 +0000	commit: feat: add Flatten/Reshape passthrough and Gemm→FC conversion
+6bd1f062e3a1fdedf2cbbab7a6b2fe3e946bcf44 4165d842974effe35a3ea86886f1e7fd06a7ffab Sam <sam@open-npu.dev> 1779329840 +0000	commit: feat: add Concat support to ONNX converter
+4165d842974effe35a3ea86886f1e7fd06a7ffab ea486c758e491913477a049120e238e64a771474 Sam <sam@open-npu.dev> 1779335248 +0000	commit: feat(converter): add Resize/Upsample support (Phase 2)
+ea486c758e491913477a049120e238e64a771474 316df159eece0625d2033a507076048178c2321a Sam <sam@open-npu.dev> 1779343653 +0000	commit: test(phase3): M110 full model E2E validation
+316df159eece0625d2033a507076048178c2321a c692cdd9d9116d0a03bc6d70494d6d8a7dd5ac9d Sam <sam@open-npu.dev> 1779346857 +0000	commit: test(phase3): YOLO-Tiny detection model E2E validation
+c692cdd9d9116d0a03bc6d70494d6d8a7dd5ac9d bb21fee629e0d142118515d05e8fdac7bae9feee Sam <sam@open-npu.dev> 1779347183 +0000	commit: test: add ResNet-18 E2E validation for Phase 3
+bb21fee629e0d142118515d05e8fdac7bae9feee bb21fee629e0d142118515d05e8fdac7bae9feee Sam <sam@open-npu.dev> 1779354066 +0000	reset: moving to HEAD
+bb21fee629e0d142118515d05e8fdac7bae9feee d5b1b18daf624ffc8cf6bae9f907f32158c25004 Sam <sam@open-npu.dev> 1779354112 +0000	commit: feat(converter): add mean/std preprocessing fold into first Conv
+d5b1b18daf624ffc8cf6bae9f907f32158c25004 f7deec1dc89b50781f1f5e6c30b95e84a4c7bb37 Sam <sam@open-npu.dev> 1779447768 +0000	commit: fix(issues 3-8): resolve all REVIEW_FINDINGS issues
+f7deec1dc89b50781f1f5e6c30b95e84a4c7bb37 d0f52ee15dcd24c87b4fc3f28508bcf06594e10d Sam <sam@open-npu.dev> 1779448866 +0000	commit: fix: quantize_perchannel.py 输入格式对齐主链路 + 临时文件安全
+d0f52ee15dcd24c87b4fc3f28508bcf06594e10d c14ef2ca067c9559b7182cd56d50ebc7f0bd4fcf Sam <sam@open-npu.dev> 1779450881 +0000	commit: feat: 硬件参数自由配置化（去掉固定Profile）
+c14ef2ca067c9559b7182cd56d50ebc7f0bd4fcf 0000000000000000000000000000000000000000 Sam <sam@open-npu.dev> 1779695679 +0000	Branch: renamed refs/heads/main to refs/heads/main
+c14ef2ca067c9559b7182cd56d50ebc7f0bd4fcf c14ef2ca067c9559b7182cd56d50ebc7f0bd4fcf Sam <sam@open-npu.dev> 1779695679 +0000	Branch: renamed refs/heads/main to refs/heads/main
+c14ef2ca067c9559b7182cd56d50ebc7f0bd4fcf ee1333d55f34fbc78d277951e18a37acc95f8d44 Sam <sam@open-npu.dev> 1779696190 +0000	commit: docs: add README (EN + CN)
+ee1333d55f34fbc78d277951e18a37acc95f8d44 b6c162089182d71996093a0dfd07e4b078f0e7d8 xiaoyaopeng <seuxiaoyaopeng@126.com> 1779696190 +0000	filter-branch: rewrite
+b6c162089182d71996093a0dfd07e4b078f0e7d8 6663394f4af9b9bb0f55d04a7f3989571b769203 xiaoyaopeng <seuxiaoyaopeng@126.com> 1780283458 +0000	commit: refactor: unify preprocessing to preprocess_uint8_nchw(), add INT16 E2E test
+6663394f4af9b9bb0f55d04a7f3989571b769203 b020251d68615c0ea083e738325dbce8b9395fc0 xiaoyaopeng <seuxiaoyaopeng@126.com> 1780393727 +0000	commit: fix: single-channel (C=1) support + IR624 E2E test
+b020251d68615c0ea083e738325dbce8b9395fc0 194dd83bc4b1af2aa1cc328ac8544fa27be1e1b4 xiaoyaopeng <seuxiaoyaopeng@126.com> 1781157789 +0000	commit: Add bin2golden.py bridge and test_pipeline_e2e.py
+194dd83bc4b1af2aa1cc328ac8544fa27be1e1b4 733e5d0ebf61c9efa540ff0b9c6b272f761fb2e7 xiaoyaopeng <seuxiaoyaopeng@126.com> 1781159989 +0000	commit: Fix bin2golden AddParam unpack: <HBxHBx produces 4 values not 6
+733e5d0ebf61c9efa540ff0b9c6b272f761fb2e7 fed94aa81150f6c35ba098f73c63eaa2c84ee557 xiaoyaopeng <seuxiaoyaopeng@126.com> 1781349961 +0000	commit: Fix three toolchain bugs causing CSIM↔RTL mismatch for tiled INT16 models
+fed94aa81150f6c35ba098f73c63eaa2c84ee557 33ee631eadca5f92fe95e58767438fca2f68b76d xiaoyaopeng <seuxiaoyaopeng@126.com> 1781352802 +0000	commit: Fix tile input: sequential packing, oversized padding, tile_in_size, dma_in_size
+33ee631eadca5f92fe95e58767438fca2f68b76d 65898f45adecfc3b505f76665913dbe95ef65e92 xiaoyaopeng <seuxiaoyaopeng@126.com> 1781431824 +0000	commit: Fix n_output_words for last-tile DMA store; revert wrong PPU_MODE_RELU_ONLY
+65898f45adecfc3b505f76665913dbe95ef65e92 7190c414ddf887fbba500b62add0491151ccf82d xiaoyaopeng <seuxiaoyaopeng@126.com> 1783565506 +0000	commit: fix: Pool tiling/packing + Add DDR + PTS + gen_ir624
+7190c414ddf887fbba500b62add0491151ccf82d e0973d9e45dd9ee6dbc4ec609b767f79bcb1cda1 xiaoyaopeng <seuxiaoyaopeng@126.com> 1783567097 +0000	commit: fix: tiled layers forced to DB_EN+PTS, dma_in_size for tiled
+e0973d9e45dd9ee6dbc4ec609b767f79bcb1cda1 a6e8d20738d3b16dbf3c1b68430de7e041738d67 xiaoyaopeng <seuxiaoyaopeng@126.com> 1783568641 +0000	commit: rename: ir624→model_b, m110→model_a (files + content)
+a6e8d20738d3b16dbf3c1b68430de7e041738d67 87e06777eb36ab08842fa6ecef50c71c9316756c xiaoyaopeng <seuxiaoyaopeng@126.com> 1783568999 +0000	commit: fix: replace ir624/m110 in Python file contents

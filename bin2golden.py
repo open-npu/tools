@@ -230,6 +230,20 @@ def n_wgt_words(layer):
     else:
         return 0  # no weights
 
+def wgt_per_oc_words(layer):
+    """Per-oc_group weight words (ARRAY_SIZE channels × k_depth).
+    Returns 0 if all weights fit in WGT_DEPTH (no per-oc reload needed)."""
+    if layer.op_type != OP_CONV2D and layer.op_type != OP_FC:
+        return 0  # DW conv and others: no per-oc reload
+    WGT_DEPTH = 24576  # SPAD_KB * 128, default 192KB
+    total_wgt = n_wgt_words(layer)
+    if total_wgt <= WGT_DEPTH:
+        return 0  # all fit, no reload needed
+    # Per-oc: ARRAY_SIZE × k_depth × elem_bytes / 4
+    eb = elem_bytes(layer)
+    per_oc_bytes = 16 * layer.kernel_h * layer.kernel_w * layer.in_c * eb
+    return (per_oc_bytes + 3) // 4
+
 def n_param_words(layer):
     """Per-channel params: 14 bytes each, packed into uint32 words."""
     n = len(layer.ch_params)
@@ -527,6 +541,7 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
             'concat_cfg': concat_cfg,
             'dma_in_size': dma_in_size(layer),
             'dma_wgt_size': n_wgt_words(layer) * 4,
+            'wgt_per_oc_words': wgt_per_oc_words(layer),
             'dma_out_size': dma_out_size(layer, pts),
             'dma_param_count': len(layer.ch_params),
             'tile_in_size': n_input_words(layer) * 4 if layer.tile_h > 0 else 0,
