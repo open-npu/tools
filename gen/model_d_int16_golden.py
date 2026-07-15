@@ -154,7 +154,7 @@ def main():
     print("\n=== Step 6: Pack outputs from CSIM dumps ===")
     for i, m in enumerate(md):
         if i not in csim_outputs:
-            print(f"  L{i}: no CSIM dump (fused block?), skipping")
+            print(f"  L{i}: no CSIM dump (fused block intermediate), skipping")
             continue
 
         out_raw = csim_outputs[i].astype(np.int16)
@@ -168,10 +168,8 @@ def main():
         layer = layers[i]
         input_src = m.get('input_src', -1)
 
-        # For Add/Concat: input comes from residual_src
-        if (m['op_type'] == 4 or m['op_type'] == 7) and m.get('residual_src', -1) >= 0:
-            input_src = m['residual_src']
-
+        # For Add: input_a comes from previous layer (NOT residual_src)
+        # residual_src is only used for input_b (saved separately below)
         if input_src >= 0 and input_src in csim_outputs:
             inp_raw = csim_outputs[input_src].astype(np.int16)
             inp_c, inp_h, inp_w = m['in_c'], m['in_h'], m['in_w']
@@ -189,18 +187,19 @@ def main():
         elif i == 0:
             inp_nhwc = input_nhwc
         else:
-            # Fused block: try to find nearest available layer
+            # Fused block end: input is from previous fused block or earlier layer
+            # Find nearest available layer with matching input dimensions
+            inp_c, inp_h, inp_w = m['in_c'], m['in_h'], m['in_w']
+            expected_elems = inp_h * inp_w * inp_c
+            inp_nhwc = None
             for j in range(i - 1, -1, -1):
-                if j in csim_outputs:
+                if j in csim_outputs and len(csim_outputs[j]) == expected_elems:
                     inp_raw = csim_outputs[j].astype(np.int16)
-                    inp_c, inp_h, inp_w = m['in_c'], m['in_h'], m['in_w']
-                    if len(inp_raw) == inp_h * inp_w * inp_c:
-                        inp_nhwc = inp_raw.reshape(inp_h, inp_w, inp_c)
-                    else:
-                        inp_nhwc = inp_raw
+                    inp_nhwc = inp_raw.reshape(inp_h, inp_w, inp_c)
                     break
-            else:
-                inp_nhwc = input_nhwc
+            if inp_nhwc is None:
+                print(f"  L{i}: WARNING — no matching input found (need {expected_elems} elems), skipping")
+                continue
 
         pts = True if m.get('store_mode', 0) & 1 else None
         inp_words = pack_input_to_words(inp_nhwc, layer)
