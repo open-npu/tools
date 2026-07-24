@@ -406,6 +406,36 @@ def ref_postproc_add(input_a, input_b, add_params, cfg):
     return result.astype(np.int8)
 
 
+# Pool reciprocal LUT — must match npu_compute.v recip_pool() exactly
+_POOL_RECIP = {
+    1:  0x80000000,  # 1/1 with >>31
+    2:  0x80000000,  # 1/2 with >>32
+    3:  0x55555556,
+    4:  0x40000000,
+    5:  0x33333333,
+    6:  0x2AAAAAAB,
+    7:  0x24924925,
+    8:  0x20000000,
+    9:  0x1C71C71C,
+    10: 0x1999999A,
+    11: 0x1745D174,
+    12: 0x15555555,
+    13: 0x13B13B14,
+    14: 0x12492492,
+    15: 0x11111111,
+    16: 0x10000000,
+    25: 0x0A3D70A4,
+    36: 0x071C71C7,
+    49: 0x05405405,
+    64: 0x04000000,
+}
+
+
+def _recip_pool(count):
+    """Reciprocal LUT matching npu_compute.v recip_pool()."""
+    return _POOL_RECIP.get(count, 0x01000000)  # fallback: 1/256
+
+
 def ref_pooling(input_nhwc, cfg):
     """Reference Pooling (bit-exact)."""
     oh, ow = cfg.out_h, cfg.out_w
@@ -449,10 +479,22 @@ def ref_pooling(input_nhwc, cfg):
                                 result = val
 
                 if is_avg and count > 0:
+                    # Align with RTL reciprocal LUT (npu_compute.v S_POOL_DIV)
+                    # RTL: half_count = count >> 1
+                    #       rounded = pool_acc + half_count (pos) or - half_count (neg)
+                    #       prod = rounded * recip[count]
+                    #       result = prod >> 32 (count>1) or prod >> 31 (count=1)
+                    half_count = count >> 1
                     if result >= 0:
-                        result = (result + count // 2) // count
+                        rounded = result + half_count
                     else:
-                        result = (result - count // 2) // count
+                        rounded = result - half_count
+                    recip = _recip_pool(count)
+                    prod = rounded * recip
+                    if count == 1:
+                        result = prod >> 31
+                    else:
+                        result = prod >> 32
 
                 acc[o_h, o_w, c] = result
     return acc
