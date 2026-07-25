@@ -128,6 +128,7 @@ def run_csim_full_model_dump(layers, weights_list, input_nchw, work_dir, bits=16
 
     env = os.environ.copy()
     env['DUMP_LAYERS'] = '1'
+    env['ACC_WIDTH'] = '44'  # Match SoC RTL config
     result = subprocess.run(
         [CSIM_PATH, model_path, in_path, out_path],
         capture_output=True, text=True, env=env)
