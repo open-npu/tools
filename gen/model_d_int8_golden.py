@@ -120,7 +120,8 @@ def main():
             wgt_words = m['dma_wgt_size'] // 4
             if wgt_words > 24576:
                 kd = m.get('kernel_h', 1) * m.get('kernel_w', 1) * m['in_c']
-                per_oc = (16 * kd * 2 + 3) // 4
+                eb = 2 if m.get('data_type', 0) == 1 else 1  # bytes per element
+                per_oc = (16 * kd * eb + 3) // 4
                 m['wgt_per_oc_words'] = per_oc
                 print(f"  L{i}: wgt overflow {wgt_words} > 24576, per_oc={per_oc}")
             else:
