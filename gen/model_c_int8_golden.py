@@ -34,8 +34,12 @@ def create_unfused(src, dst):
     for i in range(num_layers):
         if off + 62 > len(data):
             break
-        # Clear FUSE bits
-        data[off + 48] = data[off + 48] & 0x01
+        # Clear FUSE bits (1-3) but keep DB_EN (bit0) and PTS (bit4).
+        # Keeping PTS lets generate_golden reserve FULL output footprints in
+        # the DDR address map; with PTS cleared it reserves only last-tile
+        # sizes and a PTS layer's runtime store then clobbers later layers'
+        # param/wgt regions (L13 concat output over L14's param region).
+        data[off + 48] = data[off + 48] & 0x11
 
         # Read tile config
         tile_h = struct.unpack_from('<H', data, off + 39)[0]

@@ -44,10 +44,32 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     weight_buf = profile.weight_buf_size // 2 if double_buffer else profile.weight_buf_size
     param_max_ch = profile.param_sram_max_ch
 
-    # FC and Concat don't do spatial tiling
-    if op_type in ('fc', 'concat'):
+    # FC doesn't do spatial tiling
+    if op_type == 'fc':
         return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
                 'tile_oc': out_c, 'per_tile_store_en': False}
+
+    # Concat: the input stays resident while the (wider) output is scattered
+    # into the same SRAM (out_base = in_words), so input + output must coexist.
+    # An untiled concat that exceeds one bank silently wraps the SRAM address
+    # (e.g. 26x26x64 -> 26x26x192 INT8: 10816w in + 32448w out vs 12288w).
+    # Fix: tile along rows (tile_w = out_w) so one bank holds tile_h rows of
+    # input plus tile_h rows of output.
+    if op_type == 'concat':
+        full_in = in_h * in_w * in_c * elem_size
+        full_out = out_h * out_w * out_c * elem_size
+        if not double_buffer and (full_in + full_out) <= act_bank:
+            return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
+                    'tile_oc': out_c, 'per_tile_store_en': False}
+        # Per-tile budget is one FULL bank (DB ping-pong alternates banks, and
+        # input (offset 0) + output (offset tile_in_words) coexist within it).
+        bank = profile.act_bank_size
+        per_row = out_w * (in_c + out_c) * elem_size
+        tile_h = max(1, min(out_h, bank // per_row))
+        tile_num_h = math.ceil(out_h / tile_h)
+        return {'tile_h': tile_h, 'tile_w': out_w,
+                'tile_num_h': tile_num_h, 'tile_num_w': 1,
+                'tile_oc': out_c, 'per_tile_store_en': double_buffer}
 
     # Effective kernel size (with dilation)
     kh_eff = (kernel_h - 1) * dilation_h + 1
