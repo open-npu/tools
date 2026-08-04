@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes, OP_ELTWISE_ADD
+from model_packer import PerChannelParam
 
 ONNX_PATH = '/tmp/npu_yolo_output_small__uoinc2r/model_single.onnx'
 WORK_DIR = '/tmp/model_c_int8_golden'
@@ -143,6 +144,30 @@ def main():
     layers, weight_blob = read_npu1(model_bin)
     print(f"  {len(layers)} layers, weight blob {len(weight_blob)} bytes")
 
+    # Pad the final layer's out_c up to a word-aligned multiple so the systolic
+    # writeback (which packs 4 int8 per SRAM word) doesn't misalign/corrupt the
+    # output. out_c=18 makes every pixel's byte offset p*18 non-word-aligned, and
+    # the word-granular writeback overwrites neighbouring channels (the L16 bug).
+    # Padding to 20 (zero-weight + zero-param channels) keeps the real channels'
+    # compute bit-identical and makes out_c*elem_size a multiple of 4. Safe only
+    # for the final layer — its output channels aren't consumed by a downstream
+    # layer, so the extra channels are inert. The CSIM output is padded to match
+    # in Step 6.
+    elem_sz = 1  # int8
+    last = layers[-1]
+    padded_last_oc = None
+    if (last.out_c * elem_sz) % 4 != 0:
+        new_oc = ((last.out_c * elem_sz + 3) // 4 * 4) // elem_sz
+        pad_ch = new_oc - last.out_c
+        print(f"  L{len(layers)-1}: pad out_c {last.out_c} -> {new_oc} (+{pad_ch} ch) for writeback alignment")
+        for _ in range(pad_ch):
+            last.ch_params.append(PerChannelParam(M=0, S=0, zp=0, bias_q=0))
+        # The final layer's weights are at the end of the blob — append zero channels.
+        wbytes_per_ch = last.kernel_h * last.kernel_w * last.in_c * elem_sz
+        weight_blob = weight_blob + bytes(pad_ch * wbytes_per_ch)
+        padded_last_oc = (last.out_c, new_oc)
+        last.out_c = new_oc
+
     # Step 3: Prepare input (use converter-generated INT8 input)
     input_bin = model_bin_fused.replace('.npu1.bin', '.npu1_input.bin')
     inp_int8 = np.fromfile(input_bin, dtype=np.int8)
@@ -257,6 +282,14 @@ def main():
         if i in csim_outputs:
             out_raw = csim_outputs[i].astype(np.int8)
             out_c, out_h, out_w = m['out_c'], m['out_h'], m['out_w']
+            # Pad the final layer's CSIM output (computed at the original out_c)
+            # to the padded out_c, inserting zero channels — matches the zero
+            # weight/param channels so the pad columns compare as 0 == rescale(0).
+            if padded_last_oc and i == len(md) - 1:
+                orig_oc, new_oc = padded_last_oc
+                base = out_raw.reshape(out_h, out_w, orig_oc)
+                zpad = np.zeros((out_h, out_w, new_oc - orig_oc), dtype=np.int8)
+                out_raw = np.concatenate([base, zpad], axis=2).reshape(-1)
             if len(out_raw) == out_h * out_w * out_c:
                 out_nhwc = out_raw.reshape(out_h, out_w, out_c)
             else:
