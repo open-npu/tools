@@ -121,8 +121,20 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     max_tile_h = min(out_h, act_bank // (tile_oc * elem_size))
     max_tile_w = min(out_w, act_bank // (tile_oc * elem_size))
 
+    # PTS 2D store places each tile at DDR byte offset (tx*tile_w*out_c*elem_size);
+    # the DMA writes whole words, so that offset must stay a multiple of 4. When
+    # out_c*elem_size is not a multiple of 4 (e.g. out_c=18 INT8), any column
+    # tiling (tile_w < out_w) yields a non-word-aligned store offset and corrupts
+    # the output. Restrict to full-width tiles (tile_w = out_w, no column tiling)
+    # so the per-tile offset ty*tile_h*out_w*out_c*elem_size stays word-aligned.
+    force_full_width = (out_c * elem_size) % 4 != 0
+    if force_full_width:
+        tile_w_candidates = [out_w] if out_w <= max_tile_w else []
+    else:
+        tile_w_candidates = range(1, max_tile_w + 1)
+
     for tile_h in range(1, max_tile_h + 1):
-        for tile_w in range(1, max_tile_w + 1):
+        for tile_w in tile_w_candidates:
             # Output tile constraint: tile_h * tile_w * tile_oc * elem_size <= act_bank
             out_tile_size = tile_h * tile_w * tile_oc * elem_size
             if out_tile_size > act_bank:
