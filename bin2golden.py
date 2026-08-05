@@ -331,6 +331,13 @@ def pack_input_to_words(input_nhwc, layer, pad_value=0):
     # Input: NHWC tensor of shape (in_h, in_w, in_c)
     H, W, C = input_nhwc.shape
 
+    # Resize uses GLOBAL coordinate mapping (output pixel o reads input pixel
+    # (o*in_dim)/out_dim), NOT a per-tile stride walk. Its tile input origin
+    # in input space is rsz_tile_ih_origin = (tile_y * tile_h) * in_h / out_h,
+    # mirroring RTL npu_compute.v:664-667. See memory:
+    # project_resize_tiling_global_coords.md
+    is_resize = (hasattr(layer, 'op_type') and layer.op_type == OP_RESIZE)
+
     # Compute input tile size with halo
     # Pool layers use pool_h/w and pool_stride, not kernel_h/w
     if hasattr(layer, 'op_type') and layer.op_type == 3:  # OP_POOLING
@@ -338,36 +345,78 @@ def pack_input_to_words(input_nhwc, layer, pad_value=0):
         kw = layer.pool_w
         sh = layer.pool_stride_h
         sw = layer.pool_stride_w
+    elif is_resize:
+        # Resize: tile_in_h = tile_h (stride=1, kw=1 → (tile_h-1)*1+1 = tile_h).
+        # Origins are computed per-tile via rsz_tile_origin below; the
+        # stride/kernel variables here are unused for the is_resize branch.
+        kh = kw = sh = sw = 1
     else:
         kh = layer.kernel_h
         kw = layer.kernel_w
         sh = layer.stride_h
         sw = layer.stride_w
-    inp_h = (layer.tile_h - 1) * sh + kh
-    inp_w = (layer.tile_w - 1) * sw + kw
-    
+    if not is_resize:
+        inp_h = (layer.tile_h - 1) * sh + kh
+        inp_w = (layer.tile_w - 1) * sw + kw
+
+    # Resize per-tile input origin in INPUT space (mirrors RTL npu_compute.v:664-667
+    # rsz_tile_ih_origin = (tile_y * tile_h) * in_h / out_h, Q40 reciprocal-multiply).
+    # The RTL compute reads SRAM at tile-local offset (rsz_ih0 - rsz_tile_ih_origin),
+    # and the 1D DMA controller transfers tile_in_size = tile_in_h * tile_in_w * C
+    # bytes per tile. So each tile's SRAM must hold a tile_in_h × tile_in_w × C
+    # region starting at (rsz_tile_ih_origin, rsz_tile_iw_origin) in the input
+    # image, padded with in_zp for border tiles that extend past in_h/in_w.
+    def rsz_tile_origin(tile_idx, tile_dim, in_dim, out_dim):
+        # Integer divide (tile_idx * tile_dim) * in_dim / out_dim.
+        # RTL uses Q40 reciprocal; plain integer division matches for these dims.
+        return (tile_idx * tile_dim) * in_dim // out_dim
+
     # Compute actual padded dimensions needed for ALL tiles
-    # The rightmost/bottom tiles may need more padding than pad_r/pad_b
-    max_row_end = (layer.tile_num_h - 1) * sh * layer.tile_h + inp_h
-    max_col_end = (layer.tile_num_w - 1) * sw * layer.tile_w + inp_w
-    pad_t, pad_l = layer.pad_top, layer.pad_left
-    # Oversized padding to accommodate all tile windows
-    pad_b_extra = max(0, max_row_end - (H + pad_t))
-    pad_r_extra = max(0, max_col_end - (W + pad_l))
-    
+    # The rightmost/bottom tiles' input regions (tile_in_h starting at
+    # rsz_tile_ih_origin) may extend past in_h; pad with in_zp.
+    if is_resize:
+        # tile_in_h = tile_h for Resize (stride=1, kw=1 → (tile_h-1)*1+1 = tile_h)
+        tile_in_h_rsz = layer.tile_h
+        tile_in_w_rsz = layer.tile_w
+        max_row_end = 0; max_col_end = 0
+        for ty in range(layer.tile_num_h):
+            org_h = rsz_tile_origin(ty, layer.tile_h, H, layer.out_h)
+            max_row_end = max(max_row_end, org_h + tile_in_h_rsz)
+        for tx in range(layer.tile_num_w):
+            org_w = rsz_tile_origin(tx, layer.tile_w, W, layer.out_w)
+            max_col_end = max(max_col_end, org_w + tile_in_w_rsz)
+        pad_t = pad_l = 0  # Resize has no conv halo padding
+        pad_b_extra = max(0, max_row_end - H)
+        pad_r_extra = max(0, max_col_end - W)
+    else:
+        max_row_end = (layer.tile_num_h - 1) * sh * layer.tile_h + inp_h
+        max_col_end = (layer.tile_num_w - 1) * sw * layer.tile_w + inp_w
+        pad_t, pad_l = layer.pad_top, layer.pad_left
+        # Oversized padding to accommodate all tile windows
+        pad_b_extra = max(0, max_row_end - (H + pad_t))
+        pad_r_extra = max(0, max_col_end - (W + pad_l))
+
     padded = np.full((H + pad_t + pad_b_extra, W + pad_l + pad_r_extra, C),
                      pad_value - layer.in_zp, dtype=input_nhwc.dtype)
     padded[pad_t:pad_t+H, pad_l:pad_l+W, :] = input_nhwc
-    
+
     # Extract and pack each tile
     all_words = []
     for ty in range(layer.tile_num_h):
         for tx in range(layer.tile_num_w):
-            # Input tile region in padded image
-            row_start = ty * layer.tile_h * sh
-            row_end = row_start + inp_h
-            col_start = tx * layer.tile_w * sw
-            col_end = col_start + inp_w
+            if is_resize:
+                # Global-coord origin in input space (matches RTL rsz_tile_ih_origin).
+                # Region is tile_in_h × tile_in_w × C (matches RTL tile_in_size).
+                row_start = rsz_tile_origin(ty, layer.tile_h, H, layer.out_h) + pad_t
+                row_end = row_start + layer.tile_h  # tile_in_h = tile_h for Resize
+                col_start = rsz_tile_origin(tx, layer.tile_w, W, layer.out_w) + pad_l
+                col_end = col_start + layer.tile_w  # tile_in_w = tile_w for Resize
+            else:
+                # Input tile region in padded image (stride-based origin)
+                row_start = ty * layer.tile_h * sh
+                row_end = row_start + inp_h
+                col_start = tx * layer.tile_w * sw
+                col_end = col_start + inp_w
             tile_data = padded[row_start:row_end, col_start:col_end, :]
             all_words.append(pack_flat(tile_data.flatten()))
     
