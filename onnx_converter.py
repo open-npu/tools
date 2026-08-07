@@ -704,7 +704,7 @@ def fuse_graph(nodes, weights):
 
 def convert_model(model_path, calib_dir, input_path, output_path,
                   input_format='int8-nchw', num_calib=50, bits=8,
-                  mean=None, std=None, profile=None):
+                  mean=None, std=None, profile=None, no_fuse=False):
     """Full conversion pipeline: ONNX float32 → NPU1 quantized.
 
     Args:
@@ -712,6 +712,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                    If provided, the normalization (pixel/255 - mean)/std is folded
                    into the first Conv layer weights. Default: no fold (uses [-0.5, 0.5]).
         profile: HWConfig instance for tiling/fusion constraints.
+        no_fuse: If True, skip super-layer fusion (no FUSE_START/MID/END bits);
+                 every layer runs independently with its own tiling + DDR round-trip.
     """
     if profile is None:
         profile = DEFAULT_HW
@@ -1549,7 +1551,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             'stride_h': cfg.stride_h, 'stride_w': cfg.stride_w,
         })
 
-    fused_blocks = detect_fusible_blocks(layer_dicts)
+    fused_blocks = [] if no_fuse else detect_fusible_blocks(layer_dicts)
     fused_count = 0
     for block in fused_blocks:
         # Check feasibility: compute fused tiling within SRAM constraints
@@ -1570,6 +1572,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     if fused_count > 0:
         print(f"=== Fusion: {fused_count} blocks marked for fused execution ===")
+    elif no_fuse:
+        print(f"=== Fusion: DISABLED (no_fuse=True) — all layers independent ===")
     else:
         print(f"=== Fusion: no fusible blocks detected ===")
 
