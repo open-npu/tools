@@ -166,6 +166,31 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     tile_h = best_tile_h
     tile_w = best_tile_w
 
+    # ─── Safety clamp: real DB_EN bank must hold input + FULL output ───
+    # The RTL output buffer accumulates ALL out_c channels before the per-tile
+    # store (writeback indexes by oc_group*ARRAY_SIZE; store fires on tile_done
+    # after the last oc_group). The tile_oc budget above only constrains the
+    # WEIGHT buffer and can under-size the output buffer for per-OC-reload
+    # layers (out_c > tile_oc), overflowing the single DB_EN bank and dropping
+    # the tile's bottom rows out of SRAM bounds (e.g. model_d int16 L13 out_c=512:
+    # 4x6 tile → in+out 7680w > 6144w bank → tile(0,1) bottom row written to
+    # SRAM addr 12288+ = out of bounds). Enforce the real constraint: input tile
+    # (with halo) + full output tile (out_c) must fit one bank (act_bank_size).
+    # Only shrinks tiles that would actually overflow; fitting tiles unchanged.
+    while tile_h > 1 or tile_w > 1:
+        in_tile_h = tile_h * stride_h + kh_eff - stride_h
+        in_tile_w = tile_w * stride_w + kw_eff - stride_w
+        real_in  = in_tile_h * in_tile_w * in_c * elem_size
+        real_out = tile_h * tile_w * out_c * elem_size
+        if real_in + real_out <= profile.act_bank_size:
+            break
+        if tile_h >= tile_w and tile_h > 1:
+            tile_h -= 1
+        elif tile_w > 1:
+            tile_w -= 1
+        else:
+            tile_h -= 1
+
     # Compute tile counts
     tile_num_h = math.ceil(out_h / tile_h)
     tile_num_w = math.ceil(out_w / tile_w)
