@@ -232,7 +232,10 @@ def n_wgt_words(layer):
 
 def wgt_per_oc_words(layer):
     """Per-oc_group weight words (ARRAY_SIZE channels × k_depth).
-    Returns 0 if all weights fit in WGT_DEPTH (no per-oc reload needed)."""
+    Returns 0 if all weights fit in WGT_DEPTH (no per-oc reload needed).
+    Falls back to 8-channel sub-groups when the 16-channel block itself
+    overflows the weight SRAM (e.g. Conv 3x3x512 INT16: 36864w > 24576w);
+    the RTL infers the 8-channel group size from the block size."""
     if layer.op_type != OP_CONV2D and layer.op_type != OP_FC:
         return 0  # DW conv and others: no per-oc reload
     WGT_DEPTH = 24576  # SPAD_KB * 128, default 192KB
@@ -241,8 +244,11 @@ def wgt_per_oc_words(layer):
         return 0  # all fit, no reload needed
     # Per-oc: ARRAY_SIZE × k_depth × elem_bytes / 4
     eb = elem_bytes(layer)
-    per_oc_bytes = 16 * layer.kernel_h * layer.kernel_w * layer.in_c * eb
-    return (per_oc_bytes + 3) // 4
+    kd_bytes = layer.kernel_h * layer.kernel_w * layer.in_c * eb
+    per_oc16 = (16 * kd_bytes + 3) // 4
+    if per_oc16 <= WGT_DEPTH:
+        return per_oc16
+    return (8 * kd_bytes + 3) // 4
 
 def n_param_words(layer):
     """Per-channel params: 14 bytes each, packed into uint32 words."""

@@ -139,6 +139,8 @@ def main():
                 kd = m.get('kernel_h', 1) * m.get('kernel_w', 1) * m['in_c']
                 eb = 2 if m.get('data_type', 0) == 1 else 1
                 per_oc = (16 * kd * eb + 3) // 4
+                if per_oc > 24576:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
+                    per_oc = (8 * kd * eb + 3) // 4
                 m['wgt_per_oc_words'] = per_oc
                 print(f"  L{i}: wgt overflow {wgt_words} > 24576, per_oc={per_oc}")
             else:
