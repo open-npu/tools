@@ -16,7 +16,7 @@
 | "Yosys 综合兼容"（0b04ffd） | 本次首跑综合 | ⚠️ 声称过度：历史 ABC 临时文件 437-625MB（6/2、7/14 两次试综合均爆掉未完成） |
 | DB_EN 双缓冲 | tiling 专测 + tiled 模型 | ✅ |
 
-**Deconv 已单独立项**（二期修复）：CSR 0x068 与 is_deconv 路径完整，是路径内部 bit-rot；4 个测试已挂 expect_fail 标记。
+**Deconv 已修复（2026-08-18，rtl 55c7e05）**：根因=S_SPATIAL_SETUP 的 deconv 预计算组合读取 conv_fh/fw/ch，而 spatial_setup_blk 在同状态更后才用 NBA 重写它们——除 (0,0) 外所有像素用上一像素末 tap 计算 tap0 地址。修复=块内本地分解 flat_start。4/4 测试恢复 bit-exact，全量回归仍全绿。
 
 ## 二、全量 cocotb 回归健康化（rtl a472444）
 
