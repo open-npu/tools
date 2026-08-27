@@ -54,7 +54,7 @@
 
 ### 1.3 本次执行的短检查
 
-- `design/tests/test_phase1_guards.py`：8/8 PASS。
+- `tools/tests/test_phase1_guards.py`：8/8 PASS。
 - bare-metal driver host compile：PASS。
 - FreeRTOS stub compile：PASS。
 - 十套 golden metadata 都存在：
@@ -74,15 +74,15 @@
 
 证据：
 
-- `design/PHASE1_ACCEPTANCE.md` 规定唯一入口是：
+- `tools/PHASE1_ACCEPTANCE.md` 规定唯一入口是：
 
   ```sh
-  python3 design/phase1_regression.py
+  python3 tools/phase1_regression.py
   ```
 
-- `design/phase1_regression.py:88-168` 运行 design、CSIM、RTL cocotb 和 generic synthesis。
+- `tools/phase1_regression.py:88-168` 运行 design、CSIM、RTL cocotb 和 generic synthesis。
 - 它没有调用：
-  - `design/phase1_model_matrix.py`
+  - `tools/phase1_model_matrix.py`
   - `soc/run_model_e2e.sh`
   - A–E × INT8/INT16 的十次 SoC Verilator
 
@@ -182,7 +182,7 @@ PHASE-1 REGRESSION FULL: PASS
 本次工作过程中十格 SoC 均曾跑到 bit-exact；但仓库内现存日志不能独立证明这一点：
 
 - `soc/sim/sim_*.log` 时间跨 7 月和 8 月。
-- 日志不含 design/csim/rtl/soc commit、模型 hash、golden hash、firmware hash。
+- 日志不含 tools/csim/rtl/soc commit、模型 hash、golden hash、firmware hash。
 - `sim_ma_int8.log` 横幅写的是 INT16。
 - `sim_mc_int16.log` 没有 `RESULT`，且只到 L7。
 - 当前源码和这些日志产生时的源码不同。
@@ -195,7 +195,7 @@ PHASE-1 REGRESSION FULL: PASS
 model SHA-256
 calibration-list SHA-256
 evaluation-input SHA-256
-design/csim/rtl/soc commit + dirty diff hash
+tools/csim/rtl/soc commit + dirty diff hash
 NPU1 SHA-256
 golden metadata/npy aggregate SHA-256
 NPU2 blob SHA-256
@@ -207,7 +207,7 @@ firmware + sim binary SHA-256
 
 例子：
 
-- `design/gen/model_d_int8_golden.py:64-80`：`/tmp` 中 NPU1 已存在就直接复用。
+- `tools/gen/model_d_int8_golden.py:64-80`：`/tmp` 中 NPU1 已存在就直接复用。
 - `:91-94`：CSIM 失败后 `return`，Python 进程仍可能退出 0。
 - 输出 golden 目录没有先清理或原子替换。
 
@@ -487,7 +487,7 @@ M1 DDR 性能规划不能基于现有 burst 宣称。
 1. `npu_top.v` 文件头仍写 “no ping-pong, no tiling loop”，已过期。
 2. D8 UART 横幅仍显示 INT16。
 3. `main.c` 保留 L15–L19 定向 DBG 输出。
-4. `design/README*.md` 的转换 / 测试示例与当前命令行不一致。
+4. `tools/README*.md` 的转换 / 测试示例与当前命令行不一致。
 5. `soc/fpga/zc706_npu.py` 文档写 `--load --flash`，实现没有 programmer / load / flash 路径。
 6. `firmware.hex` 和 `main_ram.init` 的时间早于当前 `main.c`；当前磁盘镜像已经落后于源码。
 7. `soc` 中有 core dump、生成目录和 `__pycache__`，发布前要清理。

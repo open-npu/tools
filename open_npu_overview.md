@@ -1,6 +1,6 @@
 # Open-NPU 整机说明
 
-这份文档是整颗 NPU 的地图。先讲它是什么、一次推理经过哪些人，再讲硬件、量化、切块、软件链、验收。切块 / 双缓冲 / 融合的信号级细节在 `design/model_d_fused_tiling_explained.md`。
+这份文档是整颗 NPU 的地图。先讲它是什么、一次推理经过哪些人，再讲硬件、量化、切块、软件链、验收。切块 / 双缓冲 / 融合的信号级细节在 `tools/model_d_fused_tiling_explained.md`。
 
 读完后应能回答：一张图从 ONNX 到 RTL 比对，中间每一步谁在干什么、数据在哪、怎样才算过。
 
@@ -49,12 +49,12 @@ SoC 仿真 / FPGA：VexRiscv 写 CSR → NPU RTL 算 → UART 打 PASS/FAIL
 
 | 目录 | 角色 |
 |---|---|
-| `design/` | 转换器、切块、打包、golden 生成、验收脚本、本说明 |
+| `tools/` | 转换器、切块、打包、golden 生成、验收脚本、本说明 |
+| `design/` | 架构 / 接口 / 寄存器规格（公开文档仓 `open-npu/design`） |
 | `csim/` | C 模拟器 `npu_sim`。数值必须和 RTL 的 PPU / 累加位宽一致 |
 | `rtl/` | 可综合 Verilog：控制器、DMA、计算核、脉动阵列、深度卷积、后处理 |
 | `soc/` | LiteX + VexRiscv + 固件 + Verilator 整机仿真 |
 | `driver/` | 独立 HAL / 驱动，和当前 SoC 固件不是同一条验收路径 |
-| `tools/` | 较早的工具说明入口；真正在用的转换器在 `design/` |
 
 `rtl/` 里还有 Icarus + cocotb 的模块测试。那是算子级。**整网对错以 `soc/sim` 的 Verilator 为准。** Icarus 跑 fused 大层可以卡几天，不代表模型本身要几天。
 
@@ -124,7 +124,7 @@ NPU 计算核 (rtl/src/npu_compute.v)
 | 权重 | `192×128 = 24576` | 96 KiB | 当前层 / 当前输出通道组的权重 |
 | 参数 | `192×16 = 3072` | 12 KiB | 每通道量化参数（14 字节/通道） |
 
-激活 SRAM 装不下整张特征图时，就要 **切块（tile）**。转换器里的 `design/tiling.py` 按这块预算算 `tile_h / tile_w`。
+激活 SRAM 装不下整张特征图时，就要 **切块（tile）**。转换器里的 `tools/tiling.py` 按这块预算算 `tile_h / tile_w`。
 
 双缓冲打开时，激活 SRAM 对半：
 
@@ -220,7 +220,7 @@ DMA 和 CPU 都按 **32-bit word** 看内存：
 
 ## 5. 量化：浮点怎么变成整数
 
-转换器 `design/onnx_converter.py` 做训练后量化（PTQ）：
+转换器 `tools/onnx_converter.py` 做训练后量化（PTQ）：
 
 1. 用标定图跑 ONNX Runtime，记每层激活范围，得到 **每张量** `scale_in` / `scale_out`
 2. 权重 **按输出通道** 量化，得到 `scale_w[ch]`
@@ -313,7 +313,7 @@ skip_store    = (fuse_start | fuse_mid) & (tile_h == 0)
 
 也就是：**切块的融合不再靠「跳过 DMA」省带宽**，改走 DDR + PTS。不切块的融合仍可 SRAM 直通。
 
-D16 的 L9–L11 切块网格不同，修完这条之后整网 bit-exact。D8 的 L16–L18 是「切块 START + 不切块 MID/END」，仍是当前缺口。信号级时间线见 `design/model_d_fused_tiling_explained.md`。
+D16 的 L9–L11 切块网格不同，修完这条之后整网 bit-exact。D8 的 L16–L18 是「切块 START + 不切块 MID/END」，仍是当前缺口。信号级时间线见 `tools/model_d_fused_tiling_explained.md`。
 
 ### 7.4 固件怎么把层串起来
 
@@ -344,7 +344,7 @@ soc/run_model_e2e.sh model_d_int16
 
 ### 8.1 转换 + CSIM dump
 
-`design/gen/model_*_golden.py`：
+`tools/gen/model_*_golden.py`：
 
 1. `convert_model()`：ONNX → NPU1（`0x4E505531`）
 2. 跑 `/data/sam/open-npu/csim/npu_sim`，`DUMP_LAYERS=1`，`ACC_WIDTH=44`
@@ -412,9 +412,9 @@ soc/run_model_e2e.sh model_d_int16
 
 脚本：
 
-- 余弦：`design/phase1_model_matrix.py`（只做门 1；验收必须加 `--rtl`）
-- 整网回归入口：`design/phase1_regression.py`（正式门，full 会跑十格两道门）
-- 硬件冻结项：`design/PHASE1_ACCEPTANCE.md`
+- 余弦：`tools/phase1_model_matrix.py`（只做门 1；验收必须加 `--rtl`）
+- 整网回归入口：`tools/phase1_regression.py`（正式门，full 会跑十格两道门）
+- 硬件冻结项：`tools/PHASE1_ACCEPTANCE.md`
 
 ---
 
@@ -474,7 +474,7 @@ cd soc/firmware && make clean && make MODEL=model_d_int8
 cd ../sim && ./obj_dir/Vsim
 
 # 只看浮点余弦（不是 RTL 门）
-python3 design/phase1_model_matrix.py
+python3 tools/phase1_model_matrix.py
 ```
 
 UART 里一层正常结束像：
@@ -521,10 +521,10 @@ Icarus 单层 fused 诊断（`rtl/tb/e2e/test_md_l11_diag.py`）不要当整网�
 
 软件：
 
-- `design/onnx_converter.py` — ONNX → NPU1
-- `design/model_packer.py` — NPU1 布局、`sched_ctrl` 位
-- `design/tiling.py` / `layer_fusion.py` / `hw_config.py`
-- `design/gen/model_*_golden.py` — 当场 CSIM → npy
+- `tools/onnx_converter.py` — ONNX → NPU1
+- `tools/model_packer.py` — NPU1 布局、`sched_ctrl` 位
+- `tools/tiling.py` / `layer_fusion.py` / `hw_config.py`
+- `tools/gen/model_*_golden.py` — 当场 CSIM → npy
 - `csim/npu_sim` — 功能 golden
 - `soc/firmware/main.c` — 链式调度和比对
 - `soc/firmware/gen_soc_test.py` — npy → NPU2 blob
@@ -532,9 +532,9 @@ Icarus 单层 fused 诊断（`rtl/tb/e2e/test_md_l11_diag.py`）不要当整网�
 
 验收与说明：
 
-- `design/PHASE1_ACCEPTANCE.md` — 正式门（偏仓库回归）
-- `design/phase1_model_matrix.py` — 十格余弦
-- `design/model_d_fused_tiling_explained.md` — 融合 / 双缓冲信号
+- `tools/PHASE1_ACCEPTANCE.md` — 正式门（偏仓库回归）
+- `tools/phase1_model_matrix.py` — 十格余弦
+- `tools/model_d_fused_tiling_explained.md` — 融合 / 双缓冲信号
 - 本文 — 整机地图
 
 ---
