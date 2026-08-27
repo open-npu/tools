@@ -5,7 +5,6 @@ Uses onnx_converter + CSIM + bin2golden.
 """
 import os, sys, glob, subprocess, numpy as np
 from PIL import Image
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'design'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes

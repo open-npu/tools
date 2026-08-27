@@ -3,7 +3,7 @@
 Phase 1 is accepted only when this command exits with status 0:
 
 ```sh
-python3 design/phase1_regression.py
+python3 tools/phase1_regression.py
 ```
 
 `--quick` and `--section` are diagnostic subsets. Their success does not qualify
@@ -41,7 +41,7 @@ a revision for a Phase-1 tag.
    - CSIM dequant vs ONNX float cosine ≥ 0.95 (INT8) or ≥ 0.99 (INT16)
    - SoC Verilator vs the CSIM golden generated in that same run, bit-exact
    Recorded cosine values, cached npu1 binaries, missing cells, and SKIP are
-   not acceptance. `python3 design/phase1_model_matrix.py` without `--rtl` is
+   not acceptance. `python3 tools/phase1_model_matrix.py` without `--rtl` is
    diagnostic cosine only and does not qualify.
 10. SoC runtime DDR outputs are initialized to poison, not golden. Golden lives
     only in the blob compare region. A layer with `PERF_Lx npu=0` is a failure.
@@ -58,7 +58,7 @@ a revision for a Phase-1 tag.
 
 ## Versioning rule
 
-After a full pass, commit the reviewed changes in `design`, `csim`, and `rtl`,
+After a full pass, commit the reviewed changes in `tools`, `csim`, and `rtl`,
 then create the same annotated tag on those three commits. Never move or reuse
 the historical `v1.0-phase1` tag. The acceptance tag is:
 

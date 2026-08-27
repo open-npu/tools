@@ -7,7 +7,6 @@ INT8 variant — same flow as INT16 but bits=8 and CSIM uses int8 dumps.
 """
 import os, sys, glob, subprocess, numpy as np
 from PIL import Image
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'design'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import struct, shutil
