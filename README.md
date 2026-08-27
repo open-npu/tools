@@ -2,7 +2,11 @@
 
 [中文版](README_CN.md)
 
-Python toolchain for converting, quantizing, and validating neural network models for the Open-NPU accelerator.
+Python toolchain for converting, quantizing, and packing neural network models for the Open-NPU accelerator.
+
+Product scripts live at the `tools/` root. Tests, golden generators, and
+Phase-1 regression live in [`internal/`](internal/README.md). Drop that
+directory as a unit at release (`rm -rf internal/`).
 
 ## Components
 
@@ -20,17 +24,17 @@ Python toolchain for converting, quantizing, and validating neural network model
 | `hw_config.py` | Hardware configuration parameters |
 | `compare.py` | Output comparison utilities |
 | `batch_accuracy.py` | Batch accuracy evaluation |
+| `ptq_mse_admm.py` | MSE clip / ADMM helpers used by the converter |
 
 ## Usage
 
 ```bash
 # Convert ONNX model to NPU binary
-python onnx_converter.py model.onnx --output model_npu/
+python onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --output model.npu1.bin
 
-# Run end-to-end validation
-python test_mobilenetv2.py
-python test_resnet18_e2e.py
-python test_yolo_tiny_e2e.py
+# Internal (not shipped at release)
+python3 internal/phase1_regression.py
+python3 internal/tests/mobilenetv2.py
 ```
 
 ## Requirements

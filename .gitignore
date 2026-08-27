@@ -4,5 +4,5 @@ __pycache__/
 *.swp
 *~
 build/
-__pycache__/
-*.pyc
+*.vcd
+*.fst

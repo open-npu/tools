@@ -2,9 +2,12 @@
 
 [English](README.md)
 
-用于 Open-NPU 加速器的神经网络模型转换、量化和验证的 Python 工具链。
+用于 Open-NPU 加速器的神经网络模型转换、量化和打包的 Python 工具链。
 
-整机地图（硬件、量化、切块、SoC 验收、十格现状）：[open-npu/design — open_npu_overview.md](https://github.com/open-npu/design/blob/main/open_npu_overview.md)。融合 / 双缓冲信号：[model_d_fused_tiling_explained.md](model_d_fused_tiling_explained.md)。
+产品脚本在 `tools/` 根目录。测试、golden 生成、Phase-1 回归在
+[`internal/`](internal/README.md)。发布时整棵删掉即可（`rm -rf internal/`）。
+
+整机地图：[open-npu/design — open_npu_overview.md](https://github.com/open-npu/design/blob/main/open_npu_overview.md)。融合 / 双缓冲信号：[internal/model_d_fused_tiling_explained.md](internal/model_d_fused_tiling_explained.md)。
 
 ## 组件
 
@@ -22,17 +25,17 @@
 | `hw_config.py` | 硬件配置参数 |
 | `compare.py` | 输出比对工具 |
 | `batch_accuracy.py` | 批量精度评估 |
+| `ptq_mse_admm.py` | 转换器使用的 MSE clip / ADMM |
 
 ## 使用方法
 
 ```bash
 # 将 ONNX 模型转换为 NPU 二进制
-python onnx_converter.py model.onnx --output model_npu/
+python onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --output model.npu1.bin
 
-# 运行端到端验证
-python test_mobilenetv2.py
-python test_resnet18_e2e.py
-python test_yolo_tiny_e2e.py
+# 内部（发布时去掉）
+python3 internal/phase1_regression.py
+python3 internal/tests/mobilenetv2.py
 ```
 
 ## 依赖
