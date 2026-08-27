@@ -780,6 +780,7 @@ def selftest():
 if __name__ == '__main__':
     import sys
     import os
+    import subprocess
 
     sim_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'csim', 'npu_sim')
     test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'csim', 'testdata')
@@ -792,13 +793,30 @@ if __name__ == '__main__':
         selftest()
 
         if not os.path.exists(sim_path):
-            print(f"Simulator not found at {sim_path}")
-            print("Build it first: cd csim && make")
-            print("(Skipping C simulator tests, Python-only passed)")
-            sys.exit(0)
+            raise FileNotFoundError(
+                f"Simulator not found at {sim_path}; build csim before testing"
+            )
 
-        # End-to-end tests would go here
-        print("End-to-end C sim tests: TODO (run after csim build)")
+        cases = [
+            ("Conv", build_test_conv(test_dir)),
+            ("DWConv", build_test_dwconv(test_dir)),
+        ]
+        for name, (model_path, input_path, ref_path) in cases:
+            output_path = os.path.join(test_dir, f'{name.lower()}_csim_output.bin')
+            result = subprocess.run(
+                [sim_path, model_path, input_path, output_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"{name} CSIM failed: {result.stderr}")
+            actual = np.fromfile(output_path, dtype=np.int8)
+            expected = np.fromfile(ref_path, dtype=np.int8)
+            if not np.array_equal(actual, expected):
+                mismatch = int(np.count_nonzero(actual != expected))
+                raise AssertionError(
+                    f"{name} CSIM mismatch: {mismatch}/{expected.size} elements"
+                )
+            print(f"  {name} C simulator E2E PASSED ({expected.size} elements)")
 
     elif len(sys.argv) > 1 and sys.argv[1] == 'pack':
         os.makedirs(test_dir, exist_ok=True)
