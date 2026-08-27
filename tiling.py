@@ -49,6 +49,19 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
                 'tile_oc': out_c, 'per_tile_store_en': False}
 
+    # Global depthwise kernels use the RTL's dedicated channel-slice streaming
+    # path; their full activation tensor intentionally does not reside in SRAM.
+    if (op_type == 'dw' and out_h == 1 and out_w == 1
+            and kernel_h == in_h and kernel_w == in_w):
+        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
+                'tile_oc': out_c, 'per_tile_store_en': False}
+
+    # Global pooling has the corresponding RTL channel-slice stream path.
+    if (op_type == 'pool' and out_h == 1 and out_w == 1
+            and kernel_h == in_h and kernel_w == in_w):
+        return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
+                'tile_oc': out_c, 'per_tile_store_en': False}
+
     # Concat: the input stays resident while the (wider) output is scattered
     # into the same SRAM (out_base = in_words), so input + output must coexist.
     # An untiled concat that exceeds one bank silently wraps the SRAM address
@@ -112,9 +125,9 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     # Strategy: maximize tile area while preferring square-ish tiles
     # (square tiles minimize halo overhead ratio)
 
-    best_tile_h = 1
-    best_tile_w = 1
-    best_area = 1
+    best_tile_h = None
+    best_tile_w = None
+    best_area = 0
 
     # Search: try all reasonable tile sizes, pick largest area with smallest perimeter
     # Limit search space for efficiency
@@ -162,7 +175,15 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
                 best_tile_w = tile_w
                 best_area = area
 
-    # If search found nothing better than 1x1, use 1x1
+    if best_tile_h is None or best_tile_w is None:
+        reason = ("word-aligned full-width tiling is impossible"
+                  if force_full_width else "even a 1x1 output tile exceeds SRAM")
+        raise ValueError(
+            f"No feasible tile for {op_type}: "
+            f"in={in_h}x{in_w}x{in_c}, out={out_h}x{out_w}x{out_c}, "
+            f"INT{elem_size * 8}; {reason}"
+        )
+
     tile_h = best_tile_h
     tile_w = best_tile_w
 
@@ -190,6 +211,17 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
             tile_w -= 1
         else:
             tile_h -= 1
+
+    in_tile_h = tile_h * stride_h + kh_eff - stride_h
+    in_tile_w = tile_w * stride_w + kw_eff - stride_w
+    real_in = in_tile_h * in_tile_w * in_c * elem_size
+    real_out = tile_h * tile_w * out_c * elem_size
+    if real_in > profile.act_bank_size or real_out > profile.act_bank_size or (
+            double_buffer and real_in + real_out > profile.act_bank_size):
+        raise ValueError(
+            f"No feasible SRAM-safe tile for {op_type}: 1x1 requires "
+            f"input={real_in}B output={real_out}B, bank={profile.act_bank_size}B"
+        )
 
     # Compute tile counts
     tile_num_h = math.ceil(out_h / tile_h)

@@ -93,7 +93,6 @@ def run_npu_pipeline(bits):
     # Step 3: Load and dequantize output
     meta = np.load(meta_path)
     out_scale = float(meta['output_scale'])
-    out_zp = int(meta['output_zp']) if 'output_zp' in meta else 0
     output_elements = int(meta['output_elements'])
 
     if bits == 16:
@@ -101,12 +100,14 @@ def run_npu_pipeline(bits):
     else:
         csim_q = np.fromfile(npu_output, dtype=np.int8)[:output_elements]
 
-    csim_float = (csim_q.astype(np.float32) - out_zp) * out_scale
+    # CSIM writes signed integers. meta['output_zp']=128 is a uint8-reader
+    # hint, not a real zero-point for signed dequant.
+    csim_float = csim_q.astype(np.float32) * out_scale
 
     print(f"  csim output elements: {len(csim_q)}")
     print(f"  csim quantized range: [{csim_q.min()}, {csim_q.max()}]")
     print(f"  csim dequant range: [{csim_float.min():.4f}, {csim_float.max():.4f}]")
-    print(f"  output scale={out_scale:.8f}, zp={out_zp}")
+    print(f"  output scale={out_scale:.8f} (signed dequant, zp unused)")
 
     return csim_float
 

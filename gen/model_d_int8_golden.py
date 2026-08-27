@@ -19,7 +19,7 @@ from bin2golden import (
 from onnx_converter import convert_model
 
 ONNX_PATH = '/data/sam/onnx_quant/model.onnx'
-CALIB_DIR = '/data/sam/onnx_quant/a3_test_images'
+CALIB_DIR = '/data/sam/model_b/O2_for_guopeng20221209/O2_quant_datas'
 WORK_DIR = '/tmp/model_d_int8_golden'
 GOLDEN_OUT = '/data/sam/open-npu/rtl/tb/golden/golden_dma_e2e/model_d_int8'
 
@@ -65,7 +65,7 @@ def main():
     if not os.path.exists(model_bin):
         # Use first calibration image as input
         import glob
-        calib_images = sorted(glob.glob(os.path.join(CALIB_DIR, '*.jpg')))
+        calib_images = sorted(glob.glob(os.path.join(CALIB_DIR, '**', '*.jpg'), recursive=True))
         input_image = calib_images[0] if calib_images else None
         convert_model(
             model_path=ONNX_PATH,
@@ -75,6 +75,7 @@ def main():
             input_format='int8-nchw',
             num_calib=20,
             bits=8,
+            ptq_method='mse',
         )
     else:
         print(f"  Model already exists: {model_bin}")
@@ -91,7 +92,7 @@ def main():
     csim_outputs = run_csim(model_bin, input_bin, WORK_DIR, len(layers), bits=8)
     if csim_outputs is None:
         print("  CSIM failed!")
-        return
+        sys.exit(1)
     print(f"  CSIM dumps loaded for {len(csim_outputs)} layers")
 
     # Step 4: Generate base golden data (weights, params, metadata)

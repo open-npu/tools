@@ -181,7 +181,7 @@ def main():
     csim_outputs = run_csim(model_bin, input_bin, WORK_DIR, len(layers), bits=8)
     if csim_outputs is None:
         print("  FATAL: CSIM failed")
-        return
+        sys.exit(1)
     print(f"  CSIM dumps loaded for {len(csim_outputs)} layers")
 
     # Step 5: Generate golden data

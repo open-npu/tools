@@ -10,7 +10,13 @@ from PIL import Image
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'design'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import struct, shutil
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes
+from tiling import compute_tiling
+from hw_config import DEFAULT_HW
+
+OP_NAMES = {0: 'conv', 1: 'dw', 2: 'fc', 3: 'pool', 4: 'add',
+            5: 'resize', 6: 'deconv', 7: 'concat'}
 
 MODEL_PATH = '/data/sam/onnx_quant/MODEL_A.onnx'
 CALIB_DIR = '/data/sam/onnx_quant/a3_test_images'
@@ -50,6 +56,69 @@ def run_csim(model_bin, input_bin, work_dir, num_layers, bits=8):
         outputs[idx] = raw
     return outputs
 
+
+def create_unfused_refit(src, dst):
+    """Clear FUSE bits and restore per-layer tiles that fit one DB bank.
+
+    Fusion writes a shared tile onto the block-start layer. After unfuse that
+    tile can exceed the 6144-word bank (A8 L6 13x12 → RTL E5, npu=0).
+    """
+    shutil.copy2(src, dst)
+    with open(dst, 'rb') as f:
+        data = bytearray(f.read())
+    magic, num_layers, woff, wsize = struct.unpack_from('<4I', data, 0)
+    off = 16
+    for i in range(num_layers):
+        if off + 62 > len(data):
+            break
+        op = data[off]
+        dt = data[off + 1]
+        in_h, in_w, in_c = struct.unpack_from('<HHH', data, off + 2)
+        out_h, out_w, out_c = struct.unpack_from('<HHH', data, off + 8)
+        kh, kw = data[off + 14], data[off + 15]
+        sh, sw = data[off + 18], data[off + 19]
+        pool_h, pool_w = data[off + 25], data[off + 26]
+        pool_sh, pool_sw = data[off + 27], data[off + 28]
+        old_h = struct.unpack_from('<H', data, off + 39)[0]
+        old_w = struct.unpack_from('<H', data, off + 41)[0]
+        data[off + 48] = data[off + 48] & 0x11  # keep DB_EN + PTS, drop FUSE
+        eb = 2 if dt else 1
+        op_name = OP_NAMES.get(op, 'conv')
+        k_h, k_w, s_h, s_w = kh, kw, sh, sw
+        if op_name == 'pool':
+            k_h, k_w, s_h, s_w = pool_h or 1, pool_w or 1, pool_sh or 1, pool_sw or 1
+        try:
+            tile = compute_tiling(
+                op_type=op_name, in_h=in_h, in_w=in_w, in_c=in_c,
+                out_h=out_h, out_w=out_w, out_c=out_c,
+                kernel_h=k_h, kernel_w=k_w, stride_h=s_h, stride_w=s_w,
+                elem_size=eb, double_buffer=True, profile=DEFAULT_HW)
+        except ValueError as e:
+            print(f"  L{i}: tile refit failed ({e}), keeping {old_h}x{old_w}")
+            tile = None
+        if tile is not None:
+            new_h, new_w = tile['tile_h'], tile['tile_w']
+            new_nh, new_nw = tile['tile_num_h'], tile['tile_num_w']
+            if (new_h, new_w) != (old_h, old_w):
+                print(f"  L{i}: tile {old_h}x{old_w} → {new_h}x{new_w} "
+                      f"({new_nh}x{new_nw})")
+            struct.pack_into('<HHHH', data, off + 39, new_h, new_w, new_nh, new_nw)
+            if new_h == 0:
+                data[off + 48] = data[off + 48] & ~0x11  # no DB/PTS if untiled
+            elif tile.get('per_tile_store_en'):
+                data[off + 48] = data[off + 48] | 0x11
+        param_ch_count = struct.unpack_from('<H', data, off + 55)[0]
+        has_lut = data[off + 57]
+        has_add = data[off + 58]
+        off += 62 + param_ch_count * 14
+        if has_add:
+            off += 8
+        if has_lut:
+            off += 768
+    with open(dst, 'wb') as f:
+        f.write(data)
+
+
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(GOLDEN_OUT, exist_ok=True)
@@ -68,25 +137,8 @@ def main():
         convert_model(MODEL_PATH, CALIB_DIR, input_bin_raw, model_bin_fused,
                       input_format='int8-nchw', num_calib=50, bits=8)
 
-    # Create unfused version if not exists
-    if not os.path.exists(model_bin):
-        print("Step 1b: Create unfused version (clear FUSE bits)")
-        import struct, shutil
-        shutil.copy2(model_bin_fused, model_bin)
-        with open(model_bin, 'rb') as f:
-            data = bytearray(f.read())
-        magic, num_layers2, woff, wsize = struct.unpack_from('<4I', data, 0)
-        off = 16  # header size
-        for i in range(num_layers2):
-            data[off + 48] = data[off + 48] & 0x01  # clear FUSE bits, keep DB_EN
-            param_ch_count = struct.unpack_from('<H', data, off + 55)[0]
-            has_lut = data[off + 57]
-            has_add = data[off + 58]
-            off += 62 + param_ch_count * 14
-            if has_add: off += 8
-            if has_lut: off += 768
-        with open(model_bin, 'wb') as f:
-            f.write(data)
+    print("Step 1b: Unfuse + refit tiles to DB bank")
+    create_unfused_refit(model_bin_fused, model_bin)
     print(f"  Model (unfused): {model_bin}")
 
     # Step 2: Read npu1 binary
@@ -117,7 +169,7 @@ def main():
     csim_outputs = run_csim(model_bin, input_bin, WORK_DIR, len(layers), bits=8)
     if csim_outputs is None:
         print("  FATAL: CSIM failed")
-        return
+        sys.exit(1)
     print(f"  CSIM dumps loaded for {len(csim_outputs)} layers")
 
     # Step 5: Generate golden data (metadata, weights, params, input L0)

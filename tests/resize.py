@@ -178,8 +178,8 @@ def run_e2e_test(model_name, onnx_model, h=8, w=8, in_c=3, bits=8, threshold=0.9
     npu_input_actual = npu_model_path.replace('.bin', '_input.bin')
 
     if not os.path.exists(CSIM_PATH):
-        print(f"  SKIP: csim not found at {CSIM_PATH}")
-        return True
+        print(f"  FAIL: csim not found at {CSIM_PATH}")
+        return False
 
     result = subprocess.run(
         [CSIM_PATH, npu_model_path, npu_input_actual, output_bin],

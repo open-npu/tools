@@ -5,7 +5,7 @@ Uses onnx_converter + CSIM + bin2golden.
 """
 import os, sys, glob, subprocess, numpy as np
 from PIL import Image
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), '..', 'design'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'design'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes
@@ -115,7 +115,7 @@ def main():
     csim_outputs = run_csim(model_bin, input_bin, WORK_DIR, len(layers), bits=16)
     if csim_outputs is None:
         print("  FATAL: CSIM failed")
-        return
+        sys.exit(1)
     print(f"  CSIM dumps loaded for {len(csim_outputs)} layers")
 
     # Step 5: Generate golden data (metadata, weights, params, input L0)

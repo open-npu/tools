@@ -102,7 +102,7 @@ def setup_model_a():
 def setup_resnet18():
     """Build and convert synthetic ResNet-18 in both INT8 and INT16 modes."""
     import onnx
-    from test_resnet18_e2e import make_resnet18_model, run_e2e
+    from resnet18_e2e import make_resnet18_model, run_e2e
 
     resnet_dir = os.path.join(OUTPUT_DIR, 'resnet18')
     os.makedirs(resnet_dir, exist_ok=True)
@@ -205,11 +205,7 @@ def test_resnet18_int16():
     print("Test 2: ResNet-18 INT16 vs FP32 (classification, 31 layers)")
     print(f"{'='*60}")
 
-    try:
-        from test_resnet18_e2e import make_resnet18_model, run_e2e
-    except ImportError:
-        print("  SKIP: test_resnet18_e2e not available")
-        return None
+    from resnet18_e2e import make_resnet18_model, run_e2e
 
     model_path, calib_dir, test_path = setup_resnet18()
 

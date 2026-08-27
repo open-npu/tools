@@ -30,9 +30,10 @@ from bin2golden import (
 )
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CSIM_PATH = os.path.join(ROOT, '..', 'csim', 'npu_sim')
-TESTDATA_DIR = os.path.join(ROOT, '..', 'csim', 'testdata')
-GOLDEN_DIR = os.path.join(ROOT, '..', 'rtl', 'tb', 'golden', 'golden_dma_e2e')
+PROJECT_ROOT = os.path.abspath(os.path.join(ROOT, '..', '..'))
+CSIM_PATH = os.path.join(PROJECT_ROOT, 'csim', 'npu_sim')
+TESTDATA_DIR = os.path.join(PROJECT_ROOT, 'csim', 'testdata')
+GOLDEN_DIR = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden', 'golden_dma_e2e')
 
 
 def run_csim_per_layer(layers, weights_list, input_nchw):
@@ -44,8 +45,7 @@ def run_csim_per_layer(layers, weights_list, input_nchw):
     """
     csim_path = CSIM_PATH
     if not os.path.exists(csim_path):
-        print(f"  SKIP: CSIM not found")
-        return None
+        raise FileNotFoundError(f"CSIM not found at {csim_path}")
 
     outputs = []
     prev_input_nchw = input_nchw

@@ -168,10 +168,22 @@ def test_ranking_preservation(model_bin, num_images=6):
     ort_pairs = np.array(ort_pairs)
     csim_pairs = np.array(csim_pairs)
 
-    # Rank correlation (Spearman)
-    from scipy.stats import spearmanr
-    rho, pval = spearmanr(ort_pairs, csim_pairs)
-    print(f"  Spearman rank correlation: {rho:.6f} (p={pval:.2e})")
+    # Spearman correlation without an optional scipy dependency. Average tied
+    # ranks exactly as scipy.stats.rankdata(method="average") does.
+    def rankdata(values):
+        order = np.argsort(values, kind='mergesort')
+        ranks = np.empty(len(values), dtype=np.float64)
+        start = 0
+        while start < len(values):
+            end = start + 1
+            while end < len(values) and values[order[end]] == values[order[start]]:
+                end += 1
+            ranks[order[start:end]] = (start + end - 1) / 2.0
+            start = end
+        return ranks
+
+    rho = float(np.corrcoef(rankdata(ort_pairs), rankdata(csim_pairs))[0, 1])
+    print(f"  Spearman rank correlation: {rho:.6f}")
     print(f"  Pairs compared: {len(ort_pairs)}")
     print(f"  ORT  pairwise range: [{ort_pairs.min():.4f}, {ort_pairs.max():.4f}]")
     print(f"  csim pairwise range: [{csim_pairs.min():.4f}, {csim_pairs.max():.4f}]")
@@ -246,11 +258,7 @@ def main():
     results.append(('Accuracy (ORT vs csim)', test_accuracy(model_bin, num_images=10)))
     results.append(('Output distribution', test_output_distribution(model_bin)))
 
-    try:
-        results.append(('Ranking preservation', test_ranking_preservation(model_bin, num_images=6)))
-    except ImportError:
-        print("\n  SKIP: scipy not available for Spearman test")
-        results.append(('Ranking preservation', True))  # skip gracefully
+    results.append(('Ranking preservation', test_ranking_preservation(model_bin, num_images=6)))
 
     # Summary
     print(f"\n{'='*60}")

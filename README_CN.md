@@ -4,6 +4,8 @@
 
 用于 Open-NPU 加速器的神经网络模型转换、量化和验证的 Python 工具链。
 
+整机地图（硬件、量化、切块、SoC 验收、十格现状）：[open_npu_overview.md](open_npu_overview.md)。融合 / 双缓冲信号：[model_d_fused_tiling_explained.md](model_d_fused_tiling_explained.md)。Phase-1 与 ZC706 整体审计：[open_npu_audit_2026_08_24.md](open_npu_audit_2026_08_24.md)。
+
 ## 组件
 
 | 脚本 | 说明 |

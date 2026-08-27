@@ -281,8 +281,10 @@ def run_reference(layers, weights_list, input_nhwc):
 
 
 def main():
-    test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'csim', 'testdata')
-    sim_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'csim', 'npu_sim')
+    project_root = os.path.abspath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+    test_dir = os.path.join(project_root, 'csim', 'testdata')
+    sim_path = os.path.join(project_root, 'csim', 'npu_sim')
     os.makedirs(test_dir, exist_ok=True)
 
     if not os.path.exists(sim_path):

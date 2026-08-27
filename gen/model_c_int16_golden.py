@@ -21,57 +21,21 @@ WORK_DIR = '/tmp/model_c_int16_golden'
 GOLDEN_OUT = '/data/sam/open-npu/rtl/tb/golden/golden_dma_e2e/model_c_int16'
 
 def create_unfused(src, dst):
-    """Create unfused version (clear FUSE bits in sched_ctrl) + enlarge tiles."""
+    """Clear FUSE bits; keep packer tiles.
+
+    A previous revision enlarged tiles using (in_c+out_c) without halo / pool
+    window. INT16 L0 28x44 then failed RTL E5 (output tile 9856w > 6144w bank)
+    and wait_done treated the idle NPU as done (npu=0).
+    """
     shutil.copy2(src, dst)
     with open(dst, 'rb') as f:
         data = bytearray(f.read())
     magic, num_layers, woff, wsize = struct.unpack_from('<4I', data, 0)
     off = 16  # header size
-    ACT_DEPTH = 12288  # SPAD_KB * 64
-    BANK = ACT_DEPTH // 2  # 6144
     for i in range(num_layers):
         if off + 62 > len(data):
             break
-        # Clear FUSE bits
-        data[off + 48] = data[off + 48] & 0x01
-
-        # Read tile config
-        tile_h = struct.unpack_from('<H', data, off + 39)[0]
-        tile_w = struct.unpack_from('<H', data, off + 41)[0]
-        in_c = struct.unpack_from('<H', data, off + 6)[0]
-        out_c = struct.unpack_from('<H', data, off + 12)[0]
-        op_type = data[off]
-        eb = 2 if (data[off + 49] >> 7) & 1 else 1  # data_type
-
-        # Enlarge tiles to reduce tile count (fits in bank)
-        if tile_h > 0 and tile_w > 0:
-            # Max tile area: BANK / ((in_c + out_c) * eb / 4)
-            max_area = BANK * 4 // ((in_c + out_c) * eb) if (in_c + out_c) > 0 else BANK
-            if max_area < 1:
-                max_area = 1
-            curr_area = tile_h * tile_w
-            if curr_area < max_area:
-                # Scale up tile keeping aspect ratio
-                scale = int((max_area / curr_area) ** 0.5)
-                if scale > 1:
-                    new_h = min(tile_h * scale, 256)  # cap
-                    new_w = min(tile_w * scale, 256)
-                    # Verify fits
-                    while new_h * new_w * (in_c + out_c) * eb // 4 > BANK and new_h > 1:
-                        new_h -= 1
-                    while new_h * new_w * (in_c + out_c) * eb // 4 > BANK and new_w > 1:
-                        new_w -= 1
-                    struct.pack_into('<H', data, off + 39, new_h)
-                    struct.pack_into('<H', data, off + 41, new_w)
-                    # Recompute tile_num
-                    out_h = struct.unpack_from('<H', data, off + 8)[0]
-                    out_w = struct.unpack_from('<H', data, off + 10)[0]
-                    new_num_h = (out_h + new_h - 1) // new_h
-                    new_num_w = (out_w + new_w - 1) // new_w
-                    struct.pack_into('<H', data, off + 43, new_num_h)
-                    struct.pack_into('<H', data, off + 45, new_num_w)
-
-        # Skip variable-length data
+        data[off + 48] = data[off + 48] & 0x01  # clear FUSE, keep DB_EN
         param_ch_count = struct.unpack_from('<H', data, off + 55)[0]
         has_lut = data[off + 57]
         has_add = data[off + 58]
@@ -150,7 +114,7 @@ def main():
     csim_outputs = run_csim(model_bin, input_bin, WORK_DIR, len(layers), bits=16)
     if csim_outputs is None:
         print("  FATAL: CSIM failed")
-        return
+        sys.exit(1)
     print(f"  CSIM dumps loaded for {len(csim_outputs)} layers")
 
     # Step 5: Generate golden data

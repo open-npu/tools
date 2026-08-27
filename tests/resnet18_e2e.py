@@ -213,30 +213,43 @@ def make_resnet18_model(num_classes=10, input_size=224):
     return model
 
 
+_MODEL_CACHE = {}
+
+
 def run_e2e(model_path, calib_dir, test_img_path, h=224, w=224, bits=8):
-    """Full E2E: convert + csim + compare."""
-    tmpdir = tempfile.mkdtemp(prefix='npu_resnet_')
+    """Convert once per model/bit-width, then run each requested image."""
+    tmpdir = tempfile.mkdtemp(prefix='npu_resnet_run_')
     
     # Prepare input
     test_img = Image.open(test_img_path).resize((w, h))
     arr = np.array(test_img).transpose(2, 0, 1).astype(np.uint8)
-    input_bin = os.path.join(tmpdir, 'input.bin')
-    arr.tofile(input_bin)
-    
-    # Convert
-    npu_model = os.path.join(tmpdir, 'model.npu1.bin')
-    try:
-        convert_model(model_path, calib_dir, input_bin, npu_model,
-                      input_format='int8-nchw', num_calib=20, bits=bits)
-    except Exception as e:
-        print(f"  FAIL: Converter error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None
+    cache_key = (os.path.abspath(model_path), os.path.abspath(calib_dir), bits)
+    if cache_key not in _MODEL_CACHE:
+        model_dir = tempfile.mkdtemp(prefix=f'npu_resnet_model_i{bits}_')
+        seed_input = os.path.join(model_dir, 'input.bin')
+        arr.tofile(seed_input)
+        npu_model = os.path.join(model_dir, 'model.npu1.bin')
+        try:
+            convert_model(model_path, calib_dir, seed_input, npu_model,
+                          input_format='int8-nchw', num_calib=20, bits=bits)
+        except Exception as e:
+            print(f"  FAIL: Converter error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+        _MODEL_CACHE[cache_key] = npu_model
+    npu_model = _MODEL_CACHE[cache_key]
     
     # Run csim
     output_bin = os.path.join(tmpdir, 'output.bin')
-    npu_input = npu_model.replace('.bin', '_input.bin')
+    meta = np.load(npu_model.replace('.bin', '_meta.npz'))
+    in_scale = float(meta['input_scale'])
+    inp_float = (arr.astype(np.float32) - 127.5) / 255.0
+    qmin, qmax = (-32768, 32767) if bits == 16 else (-128, 127)
+    input_dtype = np.int16 if bits == 16 else np.int8
+    input_q = np.clip(np.round(inp_float / in_scale), qmin, qmax).astype(input_dtype)
+    npu_input = os.path.join(tmpdir, 'input.bin')
+    input_q.tofile(npu_input)
     
     if not os.path.exists(CSIM_PATH):
         print("  SKIP: csim not found")
@@ -253,7 +266,6 @@ def run_e2e(model_path, calib_dir, test_img_path, h=224, w=224, bits=8):
         return None, None
     
     # Read and dequantize
-    meta = np.load(npu_model.replace('.bin', '_meta.npz'))
     out_scale = float(meta['output_scale'])
     
     if bits == 16:

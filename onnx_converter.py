@@ -37,6 +37,9 @@ from model_packer import (
 from tiling import compute_tiling
 from layer_fusion import detect_fusible_blocks, compute_fused_tiling
 from hw_config import DEFAULT_HW, add_hw_args, hw_config_from_args
+from ptq_mse_admm import (
+    mse_clip_range, admm_quantize_weight_perchannel, reservoir_chunks,
+)
 
 
 # ─── Utility ───
@@ -156,6 +159,7 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
     Returns:
         activation_ranges: dict { tensor_name: (min, max) }
         activation_histograms: dict { tensor_name: (percentile_min, percentile_max) }
+        activation_samples: dict { tensor_name: 1-D float samples } for MSE clip
     """
     print(f"Calibrating with images from: {calib_dir}")
 
@@ -199,6 +203,9 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
 
     PERCENTILE_LOW = 0.1   # 0.1th percentile
     PERCENTILE_HIGH = 99.9  # 99.9th percentile
+    SAMPLE_PER_IMAGE = 2048
+    rng = np.random.default_rng(0)
+    sample_chunks = {}
 
     for i, img_path in enumerate(image_files):
         inp = preprocess_image_from_file(img_path, input_shape, mean=mean, std=std)
@@ -220,6 +227,12 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
                 ranges[name] = (vmin, vmax)
                 percentile_data[name] = (p_low, p_high)
 
+            if val.size > SAMPLE_PER_IMAGE:
+                chunk = rng.choice(val, SAMPLE_PER_IMAGE, replace=False).astype(np.float32)
+            else:
+                chunk = val.astype(np.float32)
+            sample_chunks.setdefault(name, []).append(chunk)
+
         if (i + 1) % 10 == 0:
             print(f"  Calibrated {i+1}/{len(image_files)} images")
 
@@ -240,11 +253,13 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
         ranges[input_name] = (-0.5, 0.5)
         percentile_data[input_name] = (-0.5, 0.5)
 
-    print(f"  Collected ranges for {len(ranges)} tensors")
+    act_samples = reservoir_chunks(sample_chunks, rng)
+    print(f"  Collected ranges for {len(ranges)} tensors, "
+          f"MSE samples for {len(act_samples)} tensors")
 
     # Cleanup
     os.remove(temp_path)
-    return ranges, percentile_data
+    return ranges, percentile_data, act_samples
 
 
 # ─── PTQ Quantization ───
@@ -365,16 +380,17 @@ def compute_requant_params(scale_in, scale_w_perchannel, scale_out, bias_float=N
         # Quantize bias: bias_q = round(bias / (scale_in * scale_w[ch]))
         if bias_float is not None:
             denom = scale_in * scale_w_perchannel[c]
-            if denom < 1e-10:
-                # Near-zero weight channel: bias has no meaningful effect
+            if not np.isfinite(denom) or denom <= 0.0:
+                # quantize_weight_perchannel always supplies a positive scale;
+                # only reject genuinely invalid values. INT16 scale products
+                # are routinely below 1e-10 and still produce essential bias.
                 bias_q_arr[c] = 0
             else:
                 # Compute bias_q at full precision (stored as int64)
                 bq_f64 = np.float64(bias_float[c]) / denom
                 bias_q_arr[c] = int(np.round(bq_f64))
-            # Clamp to 40-bit signed range to prevent RTL PPU overflow
-            # (PPU bias register is 40-bit signed: [-2^39, 2^39-1])
-            max_bias = (1 << 39) - 1
+            # Clamp to the Phase-1 ACC_WIDTH=44 signed datapath.
+            max_bias = (1 << 43) - 1
             if bias_q_arr[c] > max_bias:
                 bias_q_arr[c] = max_bias
             elif bias_q_arr[c] < -max_bias - 1:
@@ -508,6 +524,19 @@ def fold_mean_std(nodes, weights, graph_input_name, mean, std):
         print("  WARNING: No Conv node directly consuming graph input — skipping fold")
         return nodes
 
+    # A spatially constant offset can be folded into one bias only when every
+    # output position sees the complete kernel. With implicit zero padding,
+    # border positions see fewer input samples, so a single bias correction is
+    # mathematically insufficient (and silently changes edge activations).
+    pads = first_conv.attrs.get('pads', [0, 0, 0, 0])
+    offset_c = (0.5 - mean) / std
+    if any(int(p) != 0 for p in pads) and np.any(np.abs(offset_c) > 1e-12):
+        raise ValueError(
+            "Cannot fold mean/std with a non-zero input offset into a padded "
+            "first Conv: border correction is position-dependent. Preprocess "
+            "the input explicitly or use mean=0.5."
+        )
+
     # Get weight
     weight_name = first_conv.inputs[1]
     W = weights[weight_name]  # [OC, IC, KH, KW]
@@ -616,9 +645,11 @@ def fuse_graph(nodes, weights):
                 # Just ReLU
                 relu_inputs[node.inputs[0]] = node.outputs[0]
             else:
-                # General Clip — treat as ReLU6 if min=0 (use max as clamp)
-                if clip_min is not None and clip_min == 0.0 and clip_max is not None:
-                    relu6_inputs[node.inputs[0]] = node.outputs[0]
+                raise ValueError(
+                    f"Unsupported Clip bounds in node {node.name or node.outputs[0]}: "
+                    f"min={clip_min}, max={clip_max}; only ReLU and Clip(0, 6) "
+                    "are supported"
+                )
 
     # Second pass: build fused ops
     for node in nodes:
@@ -631,7 +662,14 @@ def fuse_graph(nodes, weights):
         if node.op_type == 'Conv':
             group = node.attrs.get('group', 1)
             is_dw = (group > 1 and node.weight is not None and
-                     group == node.weight.shape[0])
+                     group == node.weight.shape[0] and
+                     node.weight.shape[1] == 1)
+            if group != 1 and not is_dw:
+                raise ValueError(
+                    f"Unsupported grouped Conv in node {node.name or node.outputs[0]}: "
+                    f"group={group}, weight_shape={getattr(node.weight, 'shape', None)}; "
+                    "only dense and depthwise Conv are supported"
+                )
             out_tensor = node.outputs[0]
             op = {
                 'type': 'dw' if is_dw else 'conv',
@@ -697,6 +735,13 @@ def fuse_graph(nodes, weights):
             }
             fused.append(op)
 
+        else:
+            raise ValueError(
+                f"Unsupported ONNX operator {node.op_type!r} in node "
+                f"{node.name or node.outputs[0]}; refusing to generate a "
+                "semantically incomplete model"
+            )
+
     return fused, passthrough_map
 
 
@@ -704,7 +749,8 @@ def fuse_graph(nodes, weights):
 
 def convert_model(model_path, calib_dir, input_path, output_path,
                   input_format='int8-nchw', num_calib=50, bits=8,
-                  mean=None, std=None, profile=None, no_fuse=False):
+                  mean=None, std=None, profile=None, no_fuse=False,
+                  ptq_method='default'):
     """Full conversion pipeline: ONNX float32 → NPU1 quantized.
 
     Args:
@@ -714,9 +760,16 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         profile: HWConfig instance for tiling/fusion constraints.
         no_fuse: If True, skip super-layer fusion (no FUSE_START/MID/END bits);
                  every layer runs independently with its own tiling + DDR round-trip.
+        ptq_method: 'default' (INT8 percentile / INT16 minmax),
+                    'mse' (MSE activation clip),
+                    'admm' (ADMM per-channel weights),
+                    'mse_admm' (both).
     """
     if profile is None:
         profile = DEFAULT_HW
+    ptq_method = (ptq_method or 'default').lower()
+    if ptq_method not in ('default', 'mse', 'admm', 'mse_admm'):
+        raise ValueError(f"unknown ptq_method={ptq_method!r}")
 
     # 1. Parse graph
     print(f"=== Parsing ONNX model (INT{bits} mode) ===")
@@ -727,8 +780,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     # 2. Calibrate (with correct mean/std preprocessing to get accurate activation ranges)
     print("\n=== Running PTQ Calibration ===")
-    act_ranges, act_percentiles = calibrate_model(model_path, calib_dir, input_shape, num_calib,
-                                                  mean=mean, std=std)
+    act_ranges, act_percentiles, act_samples = calibrate_model(
+        model_path, calib_dir, input_shape, num_calib, mean=mean, std=std)
 
     # 2.5. Fold BatchNorm into Conv (graph optimization, float32 level)
     print("\n=== Folding BatchNorm ===")
@@ -782,7 +835,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             print(f"    [{i:2d}] ADD  {n.input_shape} {act_str}")
 
     # 4. Quantize each layer
-    print(f"\n=== Quantizing layers (INT{bits} per-channel) ===")
+    print(f"\n=== Quantizing layers (INT{bits} per-channel, ptq={ptq_method}) ===")
     npu_layers = []
     weight_blobs = []
 
@@ -830,6 +883,14 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         """
         # Resolve passthrough (Reshape/Flatten output → original data tensor)
         resolved = resolve_passthrough(tensor_name)
+        use_mse = (ptq_method in ('mse', 'mse_admm') and bits < 16
+                   and resolved != input_name and tensor_name != input_name)
+        if use_mse:
+            samp = act_samples.get(resolved)
+            if samp is None:
+                samp = act_samples.get(tensor_name)
+            if samp is not None and samp.size > 32:
+                return mse_clip_range(samp, bits=bits, is_relu=is_relu_output)
         if bits >= 16:
             # INT16: use full min/max range to avoid clipping
             r = act_ranges.get(resolved) or act_ranges.get(tensor_name)
@@ -851,6 +912,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     tensor_quant[input_name] = (in_scale, in_zp)
     print(f"  Input scale={in_scale:.8f}, zp={in_zp}")
 
+    def quantize_w(weight):
+        if ptq_method in ('admm', 'mse_admm') and bits < 16:
+            return admm_quantize_weight_perchannel(weight, out_axis=0, bits=bits)
+        return quantize_weight_perchannel(weight, out_axis=0, bits=bits)
+
     for i, op in enumerate(fused_ops):
         node = op['node']
         # Determine the effective output tensor name (after relu/clip fusion)
@@ -871,7 +937,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
             # Quantize weights per-channel
             weight = node.weight
-            weight_q, scale_w = quantize_weight_perchannel(weight, out_axis=0, bits=bits)
+            weight_q, scale_w = quantize_w(weight)
             bias = node.bias
 
             # Determine output scale from activation ranges
@@ -1204,8 +1270,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 bias = all_weights[node.inputs[2]]
 
             # Quantize weight per-channel
-            weight_q, scale_w = quantize_weight_perchannel(
-                weight.reshape(out_c, 1, 1, in_c), out_axis=0, bits=bits)
+            weight_q, scale_w = quantize_w(weight.reshape(out_c, 1, 1, in_c))
             weight_q = weight_q.reshape(out_c, in_c)
 
             # Output scale
@@ -1625,17 +1690,14 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     print(f"  NPU input saved: {npu_input_path} ({input_q.size * elem_bytes} bytes)")
     print(f"  Input quant range: [{input_q.min()}, {input_q.max()}]")
 
-    # Save quantization metadata for comparison script
-    # NOTE: CSIM stores output as signed int8 bytes in symmetric quantization.
-    # When reading as uint8 (e.g. np.fromfile(..., dtype=np.uint8)), the effective
-    # zero point is 128 for proper dequantization: float = (uint8 - 128) * scale.
-    # For bits=16, output is int16 so no adjustment needed (zp_out is already 0).
+    # CSIM writes signed integers. Symmetric quant uses zp=0; dequant is q * scale.
+    # Do not store zp=128 — that hint was for uint8 readers and breaks signed int8.
     meta_path = output_path.replace('.bin', '_meta.npz')
     np.savez(meta_path,
              input_scale=in_scale,
              input_zp=in_zp,
              output_scale=scale_out,
-             output_zp=128 if (bits == 8 and zp_out == 0) else zp_out,
+             output_zp=zp_out,
              input_shape=np.array(input_shape),
              bits=bits,
              output_elements=npu_layers[-1].out_h * npu_layers[-1].out_w * npu_layers[-1].out_c)
@@ -1663,6 +1725,9 @@ if __name__ == '__main__':
                         help='Number of calibration images to use')
     parser.add_argument('--bits', type=int, default=8, choices=[8, 16],
                         help='Quantization bit-width (8 or 16)')
+    parser.add_argument('--ptq-method', default='default',
+                        choices=['default', 'mse', 'admm', 'mse_admm'],
+                        help='PTQ clip/weight method (default = current INT8 percentile)')
     parser.add_argument('--mean', type=float, nargs=3, default=None,
                         help='Per-channel input mean (e.g. 0.485 0.456 0.406 for ImageNet)')
     parser.add_argument('--std', type=float, nargs=3, default=None,
@@ -1679,4 +1744,5 @@ if __name__ == '__main__':
 
     convert_model(args.model, args.calib, args.input, args.output,
                   args.input_format, args.num_calib, bits,
-                  mean=args.mean, std=args.std, profile=hw_cfg)
+                  mean=args.mean, std=args.std, profile=hw_cfg,
+                  ptq_method=args.ptq_method)
