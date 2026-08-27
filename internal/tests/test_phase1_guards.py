@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
 from onnx_converter import compute_requant_params, fold_mean_std, fuse_graph
 from tiling import compute_tiling

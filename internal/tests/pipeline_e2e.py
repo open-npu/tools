@@ -19,6 +19,7 @@ import subprocess
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 from model_packer import (
     LayerConfig, PerChannelParam, AddParam, make_ch_params, pack_model,
     OP_CONV2D, OP_DW_CONV, OP_ELTWISE_ADD,
@@ -30,7 +31,7 @@ from bin2golden import (
 )
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(ROOT, '..', '..'))
+PROJECT_ROOT = os.path.abspath(os.path.join(ROOT, '..', '..', '..'))
 CSIM_PATH = os.path.join(PROJECT_ROOT, 'csim', 'npu_sim')
 TESTDATA_DIR = os.path.join(PROJECT_ROOT, 'csim', 'testdata')
 GOLDEN_DIR = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden', 'golden_dma_e2e')
@@ -253,7 +254,7 @@ def main():
     if args.rtl and all_ok:
         for name in args.models:
             test_name = f'test_pipeline_{name}'
-            tb_dir = os.path.join(ROOT, '..', 'rtl', 'tb')
+            tb_dir = os.path.join(PROJECT_ROOT, 'rtl', 'tb')
             env = os.environ.copy()
             env['MODULE'] = 'e2e.test_npu_dma_e2e'
             env['TESTCASE'] = test_name

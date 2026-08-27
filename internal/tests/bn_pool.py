@@ -24,6 +24,7 @@ from onnx import helper, TensorProto, numpy_helper
 import onnxruntime as ort
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 from onnx_converter import fold_batchnorm, parse_onnx_graph, convert_model
 
 CSIM_PATH = '/data/sam/open-npu/csim/npu_sim'

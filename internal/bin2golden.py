@@ -26,7 +26,7 @@ import struct
 import numpy as np
 
 # Import from model_packer
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model_packer import (
     MODEL_MAGIC, FIXED_CONFIG_SIZE, LayerConfig, PerChannelParam, AddParam,
     OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD,

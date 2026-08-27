@@ -20,7 +20,7 @@ import sys
 import os
 from dataclasses import dataclass, field
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tiling import compute_tiling
 from layer_fusion import detect_fusible_blocks, compute_fused_tiling, estimate_fusion_savings
 from hw_config import HWConfig as HWProfile, DEFAULT_HW, add_hw_args, hw_config_from_args

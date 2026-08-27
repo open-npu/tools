@@ -25,6 +25,7 @@ import numpy as np
 import onnxruntime as ort
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 from onnx_converter import convert_model
 
 MODEL_PATH = '/data/sam/model_b/WXPay_PalmIrLiveness_624_06_r20260509.onnx'

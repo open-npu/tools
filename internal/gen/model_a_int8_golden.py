@@ -8,6 +8,7 @@ INT8 variant — same flow as INT16 but bits=8 and CSIM uses int8 dumps.
 import os, sys, glob, subprocess, numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
 import struct, shutil
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes

@@ -23,8 +23,11 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-CSIM_BIN = os.path.join(os.path.dirname(__file__), '..', 'csim', 'npu_sim')
-CONVERTER = os.path.join(os.path.dirname(__file__), 'onnx_converter.py')
+_INTERNAL = os.path.dirname(os.path.abspath(__file__))
+_TOOLS = os.path.dirname(_INTERNAL)
+_ROOT = os.path.dirname(_TOOLS)
+CSIM_BIN = os.path.join(_ROOT, 'csim', 'npu_sim')
+CONVERTER = os.path.join(_TOOLS, 'onnx_converter.py')
 
 
 def preprocess_image(img_path, input_shape):

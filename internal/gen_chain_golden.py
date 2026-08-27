@@ -21,6 +21,7 @@ INTERNAL = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.dirname(INTERNAL)
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
+sys.path.insert(0, INTERNAL)
 
 from bin2golden import (
     read_npu1, pack_output_to_words, pack_input_to_words,

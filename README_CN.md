@@ -14,17 +14,10 @@
 | 脚本 | 说明 |
 |------|------|
 | `onnx_converter.py` | ONNX → NPU 二进制转换器（含 PTQ） |
-| `quantize_perchannel.py` | Per-channel INT8 量化 |
-| `quantize_int16.py` | INT16 量化（用于敏感层） |
-| `quantize_mixed.py` | 混合 INT8/INT16 精度 |
-| `quantize_fixedpoint.py` | 定点量化工具 |
-| `layer_fusion.py` | 层融合（Conv+BN+ReLU、DW super-layer） |
-| `tiling.py` | 空间 tiling 策略计算 |
 | `model_packer.py` | NPU 执行用二进制打包 |
-| `perf_model.py` | 性能建模与周期估算 |
+| `tiling.py` | 空间 tiling 策略计算 |
+| `layer_fusion.py` | 层融合（Conv+BN+ReLU、DW super-layer） |
 | `hw_config.py` | 硬件配置参数 |
-| `compare.py` | 输出比对工具 |
-| `batch_accuracy.py` | 批量精度评估 |
 | `ptq_mse_admm.py` | 转换器使用的 MSE clip / ADMM |
 
 ## 使用方法

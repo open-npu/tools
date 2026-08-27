@@ -25,6 +25,7 @@ import onnxruntime as ort
 from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 from onnx_converter import convert_model
 
 MODEL_PATH = '/data/sam/onnx_quant/MODEL_A.onnx'

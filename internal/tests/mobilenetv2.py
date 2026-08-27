@@ -21,6 +21,7 @@ import numpy as np
 
 # Add tools to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 from model_packer import (
     LayerConfig, PerChannelParam, pack_model, make_ch_params,
     ref_conv2d, ref_dwconv, ref_pooling, ref_postproc_perchannel,

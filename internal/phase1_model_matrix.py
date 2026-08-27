@@ -24,6 +24,7 @@ INTERNAL = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.dirname(INTERNAL)
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
+sys.path.insert(0, INTERNAL)
 from onnx_converter import convert_model
 
 CSIM = os.path.join(ROOT, "csim", "npu_sim")

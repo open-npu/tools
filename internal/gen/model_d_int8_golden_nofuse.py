@@ -17,7 +17,9 @@ import os, sys, subprocess, struct, shutil
 import numpy as np
 
 _TOOLS_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+_INTERNAL = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, _TOOLS_ROOT)
+sys.path.insert(0, _INTERNAL)
 
 from bin2golden import (
     read_npu1, generate_golden, pack_input_to_words, pack_output_to_words,

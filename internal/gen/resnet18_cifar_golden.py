@@ -6,6 +6,7 @@ Uses test_resnet18_e2e.py's make_resnet18_model with input_size=32.
 import os, sys, numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
 from onnx_converter import convert_model
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes
@@ -18,7 +19,7 @@ GOLDEN_OUT = '/data/sam/open-npu/rtl/tb/golden/golden_dma_e2e/resnet18_cifar_int
 def run_csim(layers, weights_list, input_nchw, work_dir, bits=16):
     """Run CSIM with DUMP_LAYERS=1 to get per-layer outputs."""
     import subprocess
-    csim_exe = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'csim', 'npu_sim')
+    csim_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'csim', 'npu_sim')
     
     model_bin = os.path.join(work_dir, 'resnet18_cifar.npu1.bin')
     inp_path = os.path.join(work_dir, 'resnet18_cifar.npu1_input.bin')

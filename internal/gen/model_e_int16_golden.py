@@ -32,7 +32,9 @@ from PIL import Image
 
 # Tools path
 TOOLS = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+INTERNAL = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, TOOLS)
+sys.path.insert(0, INTERNAL)
 
 from onnx_converter import convert_model
 from model_packer import pack_model, LayerConfig, OP_ELTWISE_ADD
