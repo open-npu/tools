@@ -266,6 +266,81 @@ def compute_fused_tiling(block: FusedBlock, elem_size: int = 1,
     )
 
 
+# sched_ctrl bits (must match model_packer.py)
+_FUSE_START = 1 << 1
+_FUSE_MID = 1 << 2
+_FUSE_END = 1 << 3
+_DB_EN = 1 << 0
+_PTS = 1 << 4
+
+
+def stamp_fused_tiling(layers, block: FusedBlock, tiling: FusedTiling,
+                       include_add: bool = True) -> int:
+    """Write one tile grid onto every layer of an IR block.
+
+    START / MID / END (and a following residual Add with the same spatial
+    size) share tile_h/w/num. DMA double-buffer is cleared so fusion can
+    use the two native act regions. If the whole map fits in one tile,
+    tiles are cleared (tile_h=0) so the existing untiled skip-DMA path
+    can fire.
+
+    Returns the number of layers stamped.
+    """
+    if not tiling.feasible:
+        return 0
+
+    idxs = [block.start_idx, block.start_idx + 1, block.end_idx]
+    fuse_bits = [_FUSE_START, _FUSE_MID, _FUSE_END]
+
+    add_idx = block.end_idx + 1
+    if include_add and add_idx < len(layers):
+        add = layers[add_idx]
+        add_op = add.op_type if hasattr(add, 'op_type') else add.get('op_type')
+        add_oh = add.out_h if hasattr(add, 'out_h') else add.get('out_h')
+        add_ow = add.out_w if hasattr(add, 'out_w') else add.get('out_w')
+        add_oc = add.out_c if hasattr(add, 'out_c') else add.get('out_c')
+        if add_op in ('add', 4) and add_oh == block.out_h and add_ow == block.out_w \
+                and add_oc == block.c_out:
+            idxs.append(add_idx)
+            fuse_bits.append(0)
+
+    # One spatial tile → present as untiled so RTL skip_act_load (tile_h==0) works.
+    if tiling.spatial_tiles <= 1:
+        th = tw = nh = nw = 0
+    else:
+        th = tiling.tile_h
+        tw = tiling.tile_w
+        nh = math.ceil(block.out_h / th)
+        nw = math.ceil(block.out_w / tw)
+
+    def _set(obj, key, val):
+        if hasattr(obj, key):
+            setattr(obj, key, val)
+        else:
+            obj[key] = val
+
+    def _get(obj, key, default=0):
+        if hasattr(obj, key):
+            return getattr(obj, key)
+        return obj.get(key, default)
+
+    for idx, fbit in zip(idxs, fuse_bits):
+        lyr = layers[idx]
+        sched = int(_get(lyr, 'sched_ctrl', 0))
+        sched &= ~(_DB_EN | _FUSE_START | _FUSE_MID | _FUSE_END | _PTS)
+        sched |= fbit
+        # END (and Add) still write the block output; PTS only if spatially tiled.
+        if th > 0 and fbit in (0, _FUSE_END):
+            sched |= _PTS
+        _set(lyr, 'sched_ctrl', sched)
+        _set(lyr, 'tile_h', th)
+        _set(lyr, 'tile_w', tw)
+        _set(lyr, 'tile_num_h', nh)
+        _set(lyr, 'tile_num_w', nw)
+
+    return len(idxs)
+
+
 def estimate_fusion_savings(block: FusedBlock, tiling: FusedTiling,
                             elem_size: int = 1) -> dict:
     """Estimate DMA byte savings from fusing a block.
@@ -527,6 +602,37 @@ if __name__ == '__main__':
     print(f"  Block: 40×80, c_in=32, c_mid=64, c_out=32")
     print(f"  Tile: {t.tile_h}×{t.tile_w}, spatial_tiles={t.spatial_tiles} ({tiles_h}H × {tiles_w}W)")
     print(f"  PASS: Non-square handled correctly")
+
+    # ─── Test 4: stamp writes the same grid on START/MID/END + Add ───
+    print("\n--- stamp_fused_tiling unifies the IR grid ---")
+    stamped = [
+        {'op_type': 'conv', 'out_h': 56, 'out_w': 56, 'out_c': 112,
+         'tile_h': 1, 'tile_w': 109, 'tile_num_h': 112, 'tile_num_w': 2,
+         'sched_ctrl': 1},
+        {'op_type': 'dw', 'out_h': 56, 'out_w': 56, 'out_c': 112,
+         'tile_h': 6, 'tile_w': 6, 'tile_num_h': 10, 'tile_num_w': 10,
+         'sched_ctrl': 1},
+        {'op_type': 'conv', 'out_h': 56, 'out_w': 56, 'out_c': 56,
+         'tile_h': 8, 'tile_w': 9, 'tile_num_h': 7, 'tile_num_w': 7,
+         'sched_ctrl': 1},
+        {'op_type': 'add', 'out_h': 56, 'out_w': 56, 'out_c': 56,
+         'tile_h': 9, 'tile_w': 9, 'tile_num_h': 7, 'tile_num_w': 7,
+         'sched_ctrl': 1},
+    ]
+    blk = FusedBlock(start_idx=0, end_idx=2, out_h=56, out_w=56,
+                     c_in=56, c_mid=112, c_out=56, dw_kernel=3, dw_stride=1)
+    ft = compute_fused_tiling(blk)
+    assert ft.feasible
+    n = stamp_fused_tiling(stamped, blk, ft)
+    assert n == 4, f"expected 4 stamped layers, got {n}"
+    grids = [(s['tile_h'], s['tile_w'], s['tile_num_h'], s['tile_num_w']) for s in stamped]
+    assert len(set(grids)) == 1, f"grids diverged: {grids}"
+    assert all((s['sched_ctrl'] & _DB_EN) == 0 for s in stamped), "DB_EN must be off"
+    assert stamped[0]['sched_ctrl'] & _FUSE_START
+    assert stamped[1]['sched_ctrl'] & _FUSE_MID
+    assert stamped[2]['sched_ctrl'] & _FUSE_END
+    print(f"  Shared grid: {grids[0][0]}×{grids[0][1]}  {grids[0][2]}×{grids[0][3]} tiles")
+    print("  PASS: START/MID/END/Add share one grid, DB_EN cleared")
 
     print("\n" + "=" * 70)
     print("Self-test PASSED")

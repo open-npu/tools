@@ -35,7 +35,7 @@ from model_packer import (
     SCHED_CTRL_PER_TILE_STORE,
 )
 from tiling import compute_tiling
-from layer_fusion import detect_fusible_blocks, compute_fused_tiling
+from layer_fusion import detect_fusible_blocks, compute_fused_tiling, stamp_fused_tiling
 from hw_config import DEFAULT_HW, add_hw_args, hw_config_from_args
 from ptq_mse_admm import (
     mse_clip_range, admm_quantize_weight_perchannel, reservoir_chunks,
@@ -1619,24 +1619,28 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     fused_blocks = [] if no_fuse else detect_fusible_blocks(layer_dicts)
     fused_count = 0
     for block in fused_blocks:
-        # Check feasibility: compute fused tiling within SRAM constraints
+        # Largest square-ish tile that fits the two act regions (no extra DMA DB).
         tiling = compute_fused_tiling(block, elem_size, profile=profile)
         if not tiling.feasible:
             continue
-        # Mark layers with fusion bits (preserve existing sched_ctrl bits)
-        npu_layers[block.start_idx].sched_ctrl |= SCHED_CTRL_FUSE_START
-        npu_layers[block.start_idx + 1].sched_ctrl |= SCHED_CTRL_FUSE_MID
-        npu_layers[block.end_idx].sched_ctrl |= SCHED_CTRL_FUSE_END
-        # Override tile_h/tile_w for the first layer to match fused tiling
-        npu_layers[block.start_idx].tile_h = tiling.tile_h
-        npu_layers[block.start_idx].tile_w = tiling.tile_w
-        # Recompute tile_num for fused spatial
-        npu_layers[block.start_idx].tile_num_h = math.ceil(block.out_h / tiling.tile_h)
-        npu_layers[block.start_idx].tile_num_w = math.ceil(block.out_w / tiling.tile_w)
+        n_stamped = stamp_fused_tiling(npu_layers, block, tiling, include_add=True)
+        if n_stamped == 0:
+            continue
         fused_count += 1
+        th = npu_layers[block.start_idx].tile_h
+        tw = npu_layers[block.start_idx].tile_w
+        nh = npu_layers[block.start_idx].tile_num_h
+        nw = npu_layers[block.start_idx].tile_num_w
+        extra = " +Add" if n_stamped > 3 else ""
+        if th == 0:
+            grid = "untiled (fits SRAM, skip-DMA)"
+        else:
+            grid = f"{th}×{tw} × {nh}×{nw} tiles (same grid; skip-DMA needs tile-major)"
+        print(f"    IR L{block.start_idx}-{block.end_idx}{extra}: "
+              f"{block.out_h}×{block.out_w} {block.c_in}→{block.c_mid}→{block.c_out}  {grid}")
 
     if fused_count > 0:
-        print(f"=== Fusion: {fused_count} blocks marked for fused execution ===")
+        print(f"=== Fusion: {fused_count} IR blocks share a large-tile grid ===")
     elif no_fuse:
         print(f"=== Fusion: DISABLED (no_fuse=True) — all layers independent ===")
     else:
