@@ -27,6 +27,9 @@ from PIL import Image
 # Import our model_packer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_packer import (
+    MAC_LANES,
+    WGT_LAYOUT_OC_MAJOR, WGT_LAYOUT_K_MAJOR,
+    conv_weights_to_blob, dw_weights_to_blob,
     LayerConfig, PerChannelParam, AddParam, pack_model,
     OP_CONV2D, OP_DW_CONV, OP_FC, OP_POOLING, OP_ELTWISE_ADD, OP_RESIZE, OP_CONCAT,
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
@@ -263,6 +266,29 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
 
 
 # ─── PTQ Quantization ───
+
+def pick_wgt_layout(cfg, profile, bits):
+    """Choose the weight blob layout for a conv or depthwise layer.
+
+    K_MAJOR is only legal for layers the RTL will actually run on the 64-lane
+    row; the systolic path still reads OC_MAJOR. Depthwise always qualifies —
+    its blob is tap-major and tiny. Dense conv qualifies when one 64-channel
+    group's weights fit the weight buffer, which is the reload unit the row
+    works in. A layer whose single group overflows would need the weights
+    re-fetched part way through a group, so it goes to the mesh instead.
+    """
+    if cfg.op_type == OP_DW_CONV:
+        return WGT_LAYOUT_K_MAJOR
+    if cfg.op_type != OP_CONV2D:
+        return WGT_LAYOUT_OC_MAJOR
+    elem = 2 if bits == 16 else 1
+    k_depth = cfg.kernel_h * cfg.kernel_w * cfg.in_c
+    if k_depth == 0:
+        return WGT_LAYOUT_OC_MAJOR
+    group = min(MAC_LANES, cfg.out_c) * k_depth * elem
+    return (WGT_LAYOUT_K_MAJOR if group <= profile.weight_buf_size
+            else WGT_LAYOUT_OC_MAJOR)
+
 
 def compute_scale_zp_symmetric(vmin, vmax, bits=8):
     """Compute symmetric quantization scale (zp=0).
@@ -975,6 +1001,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 clamp_min=qmin, clamp_max=qmax,
                 in_zp=int(zp_in),
             )
+            cfg.wgt_layout = pick_wgt_layout(cfg, profile, bits)
             if bits == 16:
                 cfg.post_ctrl |= POST_INT16_OUT
             if op.get('relu6'):
@@ -1014,11 +1041,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             if op['type'] == 'dw':
                 # DW weight: ONNX [C,1,KH,KW] → NPU [C,KH,KW]
                 w_npu = weight_q.reshape(oc, ks[0], ks[1])
+                weight_blobs.append(dw_weights_to_blob(w_npu, cfg.wgt_layout))
             else:
                 # Conv weight: ONNX [OC,IC,KH,KW] → NPU [OC,KH,KW,IC]
                 w_npu = weight_q.transpose(0, 2, 3, 1)
-
-            weight_blobs.append(w_npu.tobytes())
+                weight_blobs.append(conv_weights_to_blob(w_npu, cfg.wgt_layout))
 
         elif op['type'] == 'add':
             # Add node: both inputs should already be quantized
