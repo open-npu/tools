@@ -55,6 +55,28 @@ SCHED_CTRL_FUSE_MID       = (1 << 2)   # bit[2]: middle layer of fused block
 SCHED_CTRL_FUSE_END       = (1 << 3)   # bit[3]: last layer of fused block
 SCHED_CTRL_PER_TILE_STORE = (1 << 4)   # bit[4]: per-tile store to NHWC DDR (cascaded inference)
 
+# ─── Weight blob layouts (LayerConfig.wgt_layout) ───
+#
+# The 64-lane row engine consumes one K tap per cycle and needs that tap's
+# weights for all lanes in the same cycle. OC_MAJOR scatters them across 64
+# unrelated addresses, which is why the RTL used to pre-expand a whole layer
+# into registers. K_MAJOR puts them side by side so a single SRAM beat feeds
+# the lanes directly.
+#
+# OC_MAJOR  dense [OC][KH][KW][IC]      byte = oc*k_depth + fh*KW*IC + fw*IC + ic
+#           dw    [C][KH][KW]           byte = c*KH*KW + fh*KW + fw
+# K_MAJOR   dense output channels grouped by MAC_LANES, K-major inside a group
+#             G_g  = min(MAC_LANES, out_c - g*MAC_LANES)
+#             byte = g*MAC_LANES*k_depth + k*G_g + oc_local
+#           dw    tap-major [KH][KW][C]  byte = (fh*KW + fw)*C + c
+#
+# Total bytes are identical under both layouts. FC and deconv always use
+# OC_MAJOR; only conv and depthwise can reach the row engine.
+WGT_LAYOUT_OC_MAJOR = 0
+WGT_LAYOUT_K_MAJOR = 1
+
+MAC_LANES = 64  # mirrors `MAC_LANES in rtl/include/npu_defines.vh
+
 
 @dataclass
 class PerChannelParam:
@@ -139,6 +161,7 @@ class LayerConfig:
     clamp_min: int = -128
     clamp_max: int = 127
     in_zp: int = 0
+    wgt_layout: int = WGT_LAYOUT_OC_MAJOR
 
     # Per-channel params (list of PerChannelParam, one per out_c)
     ch_params: List[PerChannelParam] = field(default_factory=list)
@@ -204,7 +227,7 @@ class LayerConfig:
         w16s(self.clamp_min)   # 49
         w16s(self.clamp_max)   # 51
         w8s(self.in_zp)        # 53
-        w8(0)                  # 54: _pad1
+        w8(self.wgt_layout)    # 54: wgt_layout (0=OC-major, 1=K-major)
         w16(len(self.ch_params))  # 55: param_ch_count
         w8(1 if self.has_lut else 0)  # 57: has_lut
         w8(1 if self.add_params else 0)  # 58: has_add
@@ -265,6 +288,60 @@ def pack_model(layers: list, weight_data: bytes, output_path: str):
     print(f"Model packed: {output_path} ({total} bytes)")
     print(f"  Layers: {num_layers}, descriptors: {len(descriptors_bin)} bytes")
     print(f"  Weights: {weight_size} bytes @ offset {weight_offset}")
+
+
+# ─── Weight blob serialization ───
+
+def conv_weights_to_blob(w, layout, lanes=MAC_LANES):
+    """Serialize dense conv weights [OC][KH][KW][IC] to the on-chip blob."""
+    if layout == WGT_LAYOUT_OC_MAJOR:
+        return w.tobytes()
+    oc = w.shape[0]
+    flat = w.reshape(oc, -1)
+    parts = []
+    for g in range(0, oc, lanes):
+        # [G][k_depth] -> [k_depth][G]: tap k's lanes become contiguous.
+        parts.append(flat[g:g + lanes].T.copy().tobytes())
+    return b''.join(parts)
+
+
+def conv_weights_from_blob(blob, layout, oc, kh, kw, ic, dtype, lanes=MAC_LANES):
+    """Inverse of conv_weights_to_blob; returns [OC][KH][KW][IC]."""
+    arr = np.frombuffer(blob, dtype=dtype)
+    if layout == WGT_LAYOUT_OC_MAJOR:
+        return arr.reshape(oc, kh, kw, ic)
+    k_depth = kh * kw * ic
+    out = np.empty((oc, k_depth), dtype=dtype)
+    off = 0
+    for g in range(0, oc, lanes):
+        gw = min(lanes, oc - g)
+        out[g:g + gw] = arr[off:off + gw * k_depth].reshape(k_depth, gw).T
+        off += gw * k_depth
+    return out.reshape(oc, kh, kw, ic)
+
+
+def dw_weights_to_blob(w, layout):
+    """Serialize depthwise weights [C][KH][KW] to the on-chip blob."""
+    if layout == WGT_LAYOUT_OC_MAJOR:
+        return w.tobytes()
+    return w.transpose(1, 2, 0).copy().tobytes()
+
+
+def dw_weights_from_blob(blob, layout, ch, kh, kw, dtype):
+    """Inverse of dw_weights_to_blob; returns [C][KH][KW]."""
+    arr = np.frombuffer(blob, dtype=dtype)
+    if layout == WGT_LAYOUT_OC_MAJOR:
+        return arr.reshape(ch, kh, kw)
+    return arr.reshape(kh, kw, ch).transpose(2, 0, 1)
+
+
+def conv_group_base_elems(group, k_depth, lanes=MAC_LANES):
+    """Element offset of OC group `group` in a K_MAJOR conv blob.
+
+    Only the last group can be partial, so every preceding group occupies a
+    full `lanes * k_depth`.
+    """
+    return group * lanes * k_depth
 
 
 # ─── Reference implementations for verification ───
@@ -568,7 +645,8 @@ def build_test_conv(output_dir: str):
     # Generate weights (no separate bias — it's in ch_params)
     w0 = np.random.randint(-10, 10, (4, 3, 3, 1), dtype=np.int8)
     w1 = np.random.randint(-10, 10, (2, 1, 1, 4), dtype=np.int8)
-    weight_data = w0.tobytes() + w1.tobytes()
+    weight_data = (conv_weights_to_blob(w0, layer0.wgt_layout)
+                   + conv_weights_to_blob(w1, layer1.wgt_layout))
 
     # Input (NCHW)
     input_nchw = np.random.randint(-50, 50, (1, 8, 8), dtype=np.int8)
@@ -650,7 +728,9 @@ def build_test_dwconv(output_dir: str):
     w0 = np.random.randint(-8, 8, (8, 3, 3, 1), dtype=np.int8)
     w1 = np.random.randint(-8, 8, (8, 3, 3), dtype=np.int8)
     w2 = np.random.randint(-8, 8, (4, 1, 1, 8), dtype=np.int8)
-    weight_data = w0.tobytes() + w1.tobytes() + w2.tobytes()
+    weight_data = (conv_weights_to_blob(w0, layer0.wgt_layout)
+                   + dw_weights_to_blob(w1, layer1.wgt_layout)
+                   + conv_weights_to_blob(w2, layer2.wgt_layout))
 
     input_nchw = np.random.randint(-30, 30, (1, 8, 8), dtype=np.int8)
     model_path = os.path.join(output_dir, 'test_dwconv_model.bin')

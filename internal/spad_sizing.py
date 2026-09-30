@@ -68,8 +68,8 @@ def fc(name, ic, oc):
 
 
 # ── Candidate networks ──
-# catdog32: CIFAR-scale binary classifier, plain Conv/Pool only.
-# Channel counts are multiples of the 16x16 array width.
+# catdog32 is MODEL_G: CIFAR-scale cat/dog classifier, plain Conv/Pool.
+# Channel counts are multiples of 16.
 NETS = {
     'catdog32': [
         conv('c0', 32, 32, 3, 16),

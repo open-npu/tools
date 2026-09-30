@@ -111,7 +111,7 @@ def read_npu1(path):
         layer.clamp_min = read_s16(p); p += 2
         layer.clamp_max = read_s16(p); p += 2
         layer.in_zp = read_s8(p); p += 1
-        _pad1 = read_u8(p); p += 1  # pad
+        layer.wgt_layout = read_u8(p); p += 1
         param_ch_count = read_u16(p); p += 2
         has_lut = read_u8(p); p += 1
         has_add = read_u8(p); p += 1
@@ -242,9 +242,14 @@ def wgt_per_oc_words(layer):
     total_wgt = n_wgt_words(layer)
     if total_wgt <= WGT_DEPTH:
         return 0  # all fit, no reload needed
-    # Per-oc: ARRAY_SIZE × k_depth × elem_bytes / 4
     eb = elem_bytes(layer)
     kd_bytes = layer.kernel_h * layer.kernel_w * layer.in_c * eb
+    # A K-major blob is grouped by 64 output channels and the 64-lane row
+    # iterates the same groups, so the reload unit has to be one whole group.
+    # 16- or 8-channel blocks would cut a group in half.
+    if getattr(layer, 'wgt_layout', 0) == 1:
+        return (64 * kd_bytes + 3) // 4
+    # Per-oc: ARRAY_SIZE × k_depth × elem_bytes / 4
     per_oc16 = (16 * kd_bytes + 3) // 4
     if per_oc16 <= WGT_DEPTH:
         return per_oc16
@@ -597,6 +602,7 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
             'dma_in_size': dma_in_size(layer),
             'dma_wgt_size': n_wgt_words(layer) * 4,
             'wgt_per_oc_words': wgt_per_oc_words(layer),
+            'wgt_layout': layer.wgt_layout,
             'dma_out_size': dma_out_size(layer, pts),
             'dma_param_count': len(layer.ch_params),
             'tile_in_size': n_input_words(layer) * 4 if layer.tile_h > 0 else 0,
