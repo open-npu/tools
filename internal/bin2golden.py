@@ -238,7 +238,7 @@ def wgt_per_oc_words(layer):
     the RTL infers the 8-channel group size from the block size."""
     if layer.op_type != OP_CONV2D and layer.op_type != OP_FC:
         return 0  # DW conv and others: no per-oc reload
-    WGT_DEPTH = 24576  # SPAD_KB * 128, default 192KB
+    WGT_DEPTH = 20480  # WGT_KB * 256, 80KB
     total_wgt = n_wgt_words(layer)
     if total_wgt <= WGT_DEPTH:
         return 0  # all fit, no reload needed
@@ -378,9 +378,12 @@ def pack_input_to_words(input_nhwc, layer, pad_value=0):
     # region starting at (rsz_tile_ih_origin, rsz_tile_iw_origin) in the input
     # image, padded with in_zp for border tiles that extend past in_h/in_w.
     def rsz_tile_origin(tile_idx, tile_dim, in_dim, out_dim):
-        # Integer divide (tile_idx * tile_dim) * in_dim / out_dim.
-        # RTL uses Q40 reciprocal; plain integer division matches for these dims.
-        return (tile_idx * tile_dim) * in_dim // out_dim
+        out_start = tile_idx * tile_dim
+        if layer.resize_mode:
+            # Bilinear align-corners mapping.
+            return (out_start * (in_dim - 1) // (out_dim - 1)
+                    if out_dim > 1 else 0)
+        return out_start * in_dim // out_dim if out_dim else 0
 
     # Compute actual padded dimensions needed for ALL tiles
     # The rightmost/bottom tiles' input regions (tile_in_h starting at

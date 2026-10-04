@@ -12,7 +12,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
 from onnx_converter import compute_requant_params, fold_mean_std, fuse_graph
+from model_packer import (
+    LayerConfig as PackedLayerConfig,
+    WGT_LAYOUT_K_MAJOR,
+    ref_pooling,
+)
 from tiling import compute_tiling
+from extract_npu1_layers import LayerConfig as ExtractedLayerConfig
 
 
 def node(op_type, inputs=None, outputs=None, attrs=None, weight=None):
@@ -92,6 +98,36 @@ class Phase1GuardTests(unittest.TestCase):
         )
         self.assertEqual(result["tile_num_h"], 0)
         self.assertEqual(result["tile_num_w"], 0)
+
+    def test_avg_pool_two_elements_matches_rtl_rounding(self):
+        cfg = PackedLayerConfig(
+            op_type=3, in_h=1, in_w=2, in_c=1,
+            out_h=1, out_w=1, out_c=1,
+            pool_mode=1, pool_h=1, pool_w=2,
+            pool_stride_h=1, pool_stride_w=2,
+        )
+        positive = ref_pooling(np.array([[[2], [4]]], dtype=np.int8), cfg)
+        negative = ref_pooling(np.array([[[-2], [-4]]], dtype=np.int8), cfg)
+        self.assertEqual(int(positive[0, 0, 0]), 3)
+        self.assertEqual(int(negative[0, 0, 0]), -4)
+
+    def test_npu1_extractor_matches_fixed_descriptor_layout(self):
+        packed = PackedLayerConfig(
+            op_type=1, data_type=1,
+            in_h=5, in_w=10, in_c=8,
+            out_h=3, out_w=7, out_c=8,
+            pad_top=1, pad_left=2,
+            post_ctrl=0xA5, sched_ctrl=0x0B,
+            clamp_min=-1234, clamp_max=2345,
+            in_zp=-7, wgt_layout=WGT_LAYOUT_K_MAJOR,
+        ).pack_fixed()
+        decoded, next_offset = ExtractedLayerConfig.unpack(packed, 0)
+        self.assertEqual(next_offset, 62)
+        self.assertEqual((decoded.in_h, decoded.in_w), (5, 10))
+        self.assertEqual((decoded.post_ctrl, decoded.sched_ctrl), (0xA5, 0x0B))
+        self.assertEqual((decoded.clamp_min, decoded.clamp_max), (-1234, 2345))
+        self.assertEqual(decoded.in_zp, -7)
+        self.assertEqual(decoded.wgt_layout, WGT_LAYOUT_K_MAJOR)
 
 
 if __name__ == "__main__":

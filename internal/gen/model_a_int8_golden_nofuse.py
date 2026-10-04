@@ -54,7 +54,7 @@ def main():
     from onnx_converter import convert_model
     model_bin = os.path.join(WORK_DIR, 'model_a_int8_nofuse.npu1.bin')
     input_bin = os.path.join(WORK_DIR, 'model_a_int8_nofuse.npu1_input.bin')
-    if not os.path.exists(model_bin):
+    if os.environ.get('REUSE_NPU1') != '1' or not os.path.exists(model_bin):
         print("Step 1: Convert MODEL_A to INT8 (no_fuse=True)")
         all_imgs = sorted(glob.glob(os.path.join(CALIB_DIR, '*.jpg')))
         img = Image.open(all_imgs[0]).resize((224, 224))
@@ -135,14 +135,14 @@ def main():
     for i, m in enumerate(md):
         if m['op_type'] == 0 or m['op_type'] == 2:
             wgt_words = m['dma_wgt_size'] // 4
-            if wgt_words > 24576:
+            if wgt_words > 20480:
                 kd = m.get('kernel_h', 1) * m.get('kernel_w', 1) * m['in_c']
                 eb = 2 if m.get('data_type', 0) == 1 else 1
                 per_oc = (16 * kd * eb + 3) // 4
-                if per_oc > 24576:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
+                if per_oc > 20480:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
                     per_oc = (8 * kd * eb + 3) // 4
                 m['wgt_per_oc_words'] = per_oc
-                print(f"  L{i}: wgt overflow {wgt_words} > 24576, per_oc={per_oc}")
+                print(f"  L{i}: wgt overflow {wgt_words} > 20480, per_oc={per_oc}")
             else:
                 m['wgt_per_oc_words'] = 0
         else:

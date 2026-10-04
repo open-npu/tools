@@ -359,13 +359,8 @@ def main():
         max_diff = diff.max()
         mismatch = np.sum(diff > 0)
         print(f"\n  NOT bit-exact: {mismatch}/{len(ref_flat)} differ, max_diff={max_diff}")
-        # Allow ±1 tolerance for rounding edge cases in pooling
-        if max_diff <= 1:
-            print(f"  PASS (within ±1 tolerance)")
-            status = "PASS"
-        else:
-            print(f"  FAIL (max_diff={max_diff} > 1)")
-            status = "FAIL"
+        print("  FAIL (phase-1 acceptance requires bit-exact output)")
+        status = "FAIL"
 
     print()
     print("=" * 60)

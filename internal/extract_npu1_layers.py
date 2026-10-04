@@ -132,6 +132,7 @@ class LayerConfig:
     clamp_min: int
     clamp_max: int
     in_zp: int
+    wgt_layout: int
     
     # Per-channel params
     ch_params: List[PerChannelParam]
@@ -145,28 +146,32 @@ class LayerConfig:
         Unpack layer descriptor starting at offset.
         Returns (LayerConfig, next_offset).
         """
-        # Fixed part (62 bytes)
-        fields = struct.unpack_from(
-            '<BBHHHHHHBBBBBBBBBBBBBBBBBBBBHHHHHBBHBBBH',
-            data, offset
+        if offset + FIXED_CONFIG_SIZE > len(data):
+            raise ValueError("Truncated NPU1 layer descriptor")
+
+        op_type, data_type = struct.unpack_from('<BB', data, offset)
+        in_h, in_w, in_c, out_h, out_w, out_c = struct.unpack_from(
+            '<HHHHHH', data, offset + 2
         )
-        
-        (op_type, data_type, in_h, in_w, in_c, out_h, out_w, out_c,
-         kernel_h, kernel_w, dilation_h, dilation_w, stride_h, stride_w,
+        (kernel_h, kernel_w, dilation_h, dilation_w, stride_h, stride_w,
          pad_top, pad_bottom, pad_left, pad_right,
          pool_mode, pool_h, pool_w, pool_stride_h, pool_stride_w, global_pool,
-         resize_mode, scale_h, scale_w, insert_h, insert_w,
-         concat_offset, concat_total_c, tile_h, tile_w, tile_num_h, tile_num_w,
-         post_ctrl, sched_ctrl) = fields[:36]
-        
-        # Next 4 bytes: clamp_min, clamp_max, in_zp, _pad1
-        clamp_min, clamp_max, in_zp, _pad1 = struct.unpack_from('<hbB', data, offset + 47)
-        
+         resize_mode, scale_h, scale_w, insert_h, insert_w) = struct.unpack_from(
+            '<21B', data, offset + 14
+        )
+        concat_offset, concat_total_c, tile_h, tile_w, tile_num_h, tile_num_w = (
+            struct.unpack_from('<HHHHHH', data, offset + 35)
+        )
+        post_ctrl, sched_ctrl = struct.unpack_from('<BB', data, offset + 47)
+        clamp_min, clamp_max = struct.unpack_from('<hh', data, offset + 49)
+        in_zp = struct.unpack_from('<b', data, offset + 53)[0]
+        wgt_layout = struct.unpack_from('<B', data, offset + 54)[0]
+
         # param_ch_count, has_lut, has_add, residual_src
         param_ch_count = struct.unpack_from('<H', data, offset + 55)[0]
-        has_lut = struct.unpack_from('B', data, offset + 57)[0]
-        has_add = struct.unpack_from('B', data, offset + 58)[0]
-        residual_src = struct.unpack_from('b', data, offset + 59)[0]
+        has_lut = struct.unpack_from('<B', data, offset + 57)[0]
+        has_add = struct.unpack_from('<B', data, offset + 58)[0]
+        residual_src = struct.unpack_from('<b', data, offset + 59)[0]
         input_src = struct.unpack_from('<h', data, offset + 60)[0]
         
         next_offset = offset + FIXED_CONFIG_SIZE
@@ -206,6 +211,7 @@ class LayerConfig:
             tile_h=tile_h, tile_w=tile_w, tile_num_h=tile_num_h, tile_num_w=tile_num_w,
             post_ctrl=post_ctrl, sched_ctrl=sched_ctrl,
             clamp_min=clamp_min, clamp_max=clamp_max, in_zp=in_zp,
+            wgt_layout=wgt_layout,
             ch_params=ch_params,
             add_params=add_params,
             residual_src=residual_src,
@@ -317,6 +323,7 @@ def print_layer_info(layer: LayerConfig, layer_idx: int):
     print(f"Input:  {layer.in_h}×{layer.in_w}×{layer.in_c}")
     print(f"Output: {layer.out_h}×{layer.out_w}×{layer.out_c}")
     print(f"Data type: {'INT16' if layer.data_type else 'INT8'}")
+    print(f"Weight layout: {'K-major' if layer.wgt_layout else 'OC-major'}")
     
     # Convolution/DW parameters
     if layer.op_type in [OP_CONV2D, OP_DW_CONV, OP_DECONV]:

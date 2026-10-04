@@ -54,7 +54,7 @@ def main():
 
     print("=== Step 1: Convert ONNX model (no_fuse=True, INT16) ===")
     model_bin = os.path.join(WORK_DIR, 'model_d_int16_nofuse.npu1.bin')
-    if not os.path.exists(model_bin):
+    if os.environ.get('REUSE_NPU1') != '1' or not os.path.exists(model_bin):
         import glob
         calib_images = sorted(glob.glob(os.path.join(CALIB_DIR, '*.jpg')))
         input_image = calib_images[0] if calib_images else None
@@ -69,7 +69,7 @@ def main():
             no_fuse=True,
         )
     else:
-        print(f"  Model already exists: {model_bin}")
+        print(f"  Reusing model by request: {model_bin}")
 
     input_bin = model_bin.replace('.npu1.bin', '.npu1_input.bin')
 
@@ -104,13 +104,13 @@ def main():
     for i, m in enumerate(md):
         if m['op_type'] == 0 or m['op_type'] == 2:
             wgt_words = m['dma_wgt_size'] // 4
-            if wgt_words > 24576:
+            if wgt_words > 20480:
                 kd = m.get('kernel_h', 1) * m.get('kernel_w', 1) * m['in_c']
                 per_oc = (16 * kd * 2 + 3) // 4
-                if per_oc > 24576:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
+                if per_oc > 20480:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
                     per_oc = (8 * kd * 2 + 3) // 4
                 m['wgt_per_oc_words'] = per_oc
-                print(f"  L{i}: wgt overflow {wgt_words} > 24576, per_oc={per_oc}")
+                print(f"  L{i}: wgt overflow {wgt_words} > 20480, per_oc={per_oc}")
             else:
                 m['wgt_per_oc_words'] = 0
         else:

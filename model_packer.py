@@ -485,8 +485,8 @@ def ref_postproc_add(input_a, input_b, add_params, cfg):
 
 # Pool reciprocal LUT — must match npu_compute.v recip_pool() exactly
 _POOL_RECIP = {
-    1:  0x80000000,  # 1/1 with >>31
-    2:  0x80000000,  # 1/2 with >>32
+    1:  0x40000000,  # identity is special-cased; avoids signed 0x80000000
+    2:  0x40000000,  # 1/2 with >>31
     3:  0x55555556,
     4:  0x40000000,
     5:  0x33333333,
@@ -563,12 +563,14 @@ def ref_pooling(input_nhwc, cfg):
                     #       result = prod >> 32 (count>1) or prod >> 31 (count=1)
                     half_count = count >> 1
                     if result >= 0:
-                        rounded = result + half_count
+                        rounded = int(result) + half_count
                     else:
-                        rounded = result - half_count
+                        rounded = int(result) - half_count
                     recip = _recip_pool(count)
-                    prod = rounded * recip
+                    prod = rounded * int(recip)
                     if count == 1:
+                        result = rounded
+                    elif count == 2:
                         result = prod >> 31
                     else:
                         result = prod >> 32
@@ -766,7 +768,7 @@ def build_test_add(output_dir: str):
 
     layer = LayerConfig(op_type=OP_ELTWISE_ADD,
                         in_h=h, in_w=w, in_c=c,
-                        out_h=h, out_w=h, out_c=c,
+                        out_h=h, out_w=w, out_c=c,
                         post_ctrl=PPU_MODE_ADD | POST_RELU_EN,
                         clamp_min=-128, clamp_max=127)
     layer.add_params = AddParam(M_A=16000, S_A=14, M_B=12000, S_B=13)
