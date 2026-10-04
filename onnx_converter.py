@@ -986,6 +986,11 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             strides = node.attrs.get('strides', [1, 1])
             pads = node.attrs.get('pads', [0, 0, 0, 0])
             dilations = node.attrs.get('dilations', [1, 1])
+            if dilations != [1, 1]:
+                raise ValueError(
+                    f"Unsupported Conv dilation {dilations} in {node.name}; "
+                    "the RTL address generator supports dilation=1 only"
+                )
 
             cfg = LayerConfig(
                 op_type=OP_DW_CONV if op['type'] == 'dw' else OP_CONV2D,

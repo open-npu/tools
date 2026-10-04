@@ -15,8 +15,8 @@ from dataclasses import dataclass
 class HWConfig:
     """NPU hardware configuration (all dimensions freely configurable)."""
     array_size: int = 8          # Systolic array dimension (N×N)
-    act_bank_size: int = 24576   # Bytes per activation bank (SPAD_KB=192 → ACT_DEPTH=12288w, bank=6144w=24576B)
-    weight_buf_size: int = 65536 # Bytes for weight buffer
+    act_bank_size: int = 24576   # IFM bytes (24KB). DB half is 12KB. OFM is 48KB.
+    weight_buf_size: int = 81920 # Weight SRAM bytes (80KB)
     param_sram_max_ch: int = 512 # Max output channels per param tile (= param_sram / 14)
     dw_parallel_ch: int = 8      # DW conv parallel channels (typically = array_size)
     has_int16: bool = True       # INT16 data type support
@@ -29,7 +29,9 @@ class HWConfig:
 
     @property
     def spad_total_kb(self) -> int:
-        return (self.act_bank_size * 2 + self.weight_buf_size) // 1024
+        # IFM is act_bank_size. OFM is a separate 48KB bank; param is 12KB.
+        return (self.act_bank_size + 48 * 1024
+                + self.weight_buf_size + 12 * 1024) // 1024
 
 
 # Default config: 8×8 array for A/D (1×1 + DW). 16×16 via --array-size.
@@ -61,13 +63,13 @@ def hw_config_from_args(args) -> HWConfig:
 def add_hw_args(parser):
     """Add hardware configuration arguments to an argparse parser."""
     grp = parser.add_argument_group('Hardware configuration',
-        'Override NPU hardware parameters (default: 8×8 array, 24KB+24KB act banks)')
+        'Override NPU hardware parameters (default: 8×8 array, 164KB scratchpad)')
     grp.add_argument('--array-size', type=int, default=None,
                      help='Systolic array dimension N (NxN MACs/cycle, default: 8)')
     grp.add_argument('--act-bank-kb', type=int, default=None,
-                     help='Activation bank size in KB (default: 32)')
+                     help='IFM bank size in KB (default: 24)')
     grp.add_argument('--weight-buf-kb', type=int, default=None,
-                     help='Weight buffer size in KB (default: 64)')
+                     help='Weight buffer size in KB (default: 80)')
     grp.add_argument('--param-max-ch', type=int, default=None,
                      help='Max output channels per param tile (default: 512)')
     grp.add_argument('--no-int16', action='store_true',
