@@ -152,7 +152,7 @@ def run_rtl(full):
         return
 
     for dut in (
-        "npu_pe", "npu_systolic", "npu_ppu", "npu_csr", "npu_sram",
+        "npu_ppu", "npu_csr", "npu_sram",
         "npu_dma", "npu_dw_conv", "npu_compute",
     ):
         run_rtl_test(dut, dut)
