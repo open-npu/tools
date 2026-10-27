@@ -268,26 +268,33 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
 # ─── PTQ Quantization ───
 
 def pick_wgt_layout(cfg, profile, bits):
-    """Choose the weight blob layout for a conv or depthwise layer.
+    """Choose the weight blob layout for a dense, FC, or depthwise layer.
 
-    K_MAJOR is only legal for layers the RTL will actually run on the 64-lane
-    row; the systolic path still reads OC_MAJOR. Depthwise always qualifies —
-    its blob is tap-major and tiny. Dense conv qualifies when one 64-channel
-    group's weights fit the weight buffer, which is the reload unit the row
-    works in. A layer whose single group overflows would need the weights
-    re-fetched part way through a group, so it goes to the mesh instead.
+    Dense conv and FC choose the widest power-of-two output group that fits
+    the row's weight SRAM. K_MAJOR is legal whenever at least one output
+    channel fits; narrower groups pack multiple output pixels into 64 lanes.
     """
     if cfg.op_type == OP_DW_CONV:
         return WGT_LAYOUT_K_MAJOR
-    if cfg.op_type != OP_CONV2D:
+    if cfg.op_type not in (OP_CONV2D, OP_FC):
         return WGT_LAYOUT_OC_MAJOR
     elem = 2 if bits == 16 else 1
     k_depth = cfg.kernel_h * cfg.kernel_w * cfg.in_c
     if k_depth == 0:
         return WGT_LAYOUT_OC_MAJOR
-    group = min(MAC_LANES, cfg.out_c) * k_depth * elem
-    return (WGT_LAYOUT_K_MAJOR if group <= profile.weight_buf_size
+    one_oc = k_depth * elem
+    return (WGT_LAYOUT_K_MAJOR if one_oc <= profile.weight_buf_size
             else WGT_LAYOUT_OC_MAJOR)
+
+
+def row_group_channels(cfg, profile, bits):
+    """Widest power-of-two dense output group that fits weight SRAM."""
+    elem = 2 if bits == 16 else 1
+    k_depth = cfg.kernel_h * cfg.kernel_w * cfg.in_c
+    for channels in (64, 32, 16, 8, 4, 2, 1):
+        if channels * k_depth * elem <= profile.weight_buf_size:
+            return channels
+    return 0
 
 
 def compute_scale_zp_symmetric(vmin, vmax, bits=8):
@@ -1050,7 +1057,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             else:
                 # Conv weight: ONNX [OC,IC,KH,KW] → NPU [OC,KH,KW,IC]
                 w_npu = weight_q.transpose(0, 2, 3, 1)
-                weight_blobs.append(conv_weights_to_blob(w_npu, cfg.wgt_layout))
+                lanes = (row_group_channels(cfg, profile, bits)
+                         if cfg.wgt_layout == WGT_LAYOUT_K_MAJOR else MAC_LANES)
+                weight_blobs.append(
+                    conv_weights_to_blob(w_npu, cfg.wgt_layout, lanes=lanes))
 
         elif op['type'] == 'add':
             # Add node: both inputs should already be quantized
@@ -1211,6 +1221,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                     M=1, S=0, zp=int(zp_in), bias_q=0,
                 ))
             cfg.ch_params = ch_params
+            cfg.wgt_layout = pick_wgt_layout(cfg, profile, bits)
 
             print(f"    Pool[{len(npu_layers)}]: {node.op_type} "
                   f"k={kernel_shape} s={pool_strides} "
@@ -1354,8 +1365,12 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             tensor_to_layer_idx[eff_output] = len(npu_layers) - 1
             tensor_to_layer_idx[node.outputs[0]] = len(npu_layers) - 1
 
-            # Weight blob: FC weight layout for csim is [out_c][in_c] (row-major)
-            weight_blobs.append(weight_q.tobytes())
+            # FC is a 1x1 dense convolution on the row.
+            w_npu = weight_q.reshape(out_c, 1, 1, in_c)
+            lanes = (row_group_channels(cfg, profile, bits)
+                     if cfg.wgt_layout == WGT_LAYOUT_K_MAJOR else MAC_LANES)
+            weight_blobs.append(
+                conv_weights_to_blob(w_npu, cfg.wgt_layout, lanes=lanes))
 
             print(f"    FC[{len(npu_layers)-1}]: {node.op_type} "
                   f"{in_c} → {out_c}"

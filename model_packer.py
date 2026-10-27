@@ -65,13 +65,14 @@ SCHED_CTRL_PER_TILE_STORE = (1 << 4)   # bit[4]: per-tile store to NHWC DDR (cas
 #
 # OC_MAJOR  dense [OC][KH][KW][IC]      byte = oc*k_depth + fh*KW*IC + fw*IC + ic
 #           dw    [C][KH][KW]           byte = c*KH*KW + fh*KW + fw
-# K_MAJOR   dense output channels grouped by MAC_LANES, K-major inside a group
-#             G_g  = min(MAC_LANES, out_c - g*MAC_LANES)
-#             byte = g*MAC_LANES*k_depth + k*G_g + oc_local
+# K_MAJOR   dense output channels grouped by a power-of-two G <= MAC_LANES,
+#           K-major inside each group. G is the widest group that fits WGT SRAM.
+#             G_g  = min(G, out_c - g*G)
+#             byte = g*G*k_depth + k*G_g + oc_local
 #           dw    tap-major [KH][KW][C]  byte = (fh*KW + fw)*C + c
 #
-# Total bytes are identical under both layouts. FC and deconv always use
-# OC_MAJOR; only conv and depthwise can reach the row engine.
+# Total bytes are identical under both layouts. Dense conv, FC, and depthwise
+# can use the row engine; deconv remains OC_MAJOR and unsupported row-only.
 WGT_LAYOUT_OC_MAJOR = 0
 WGT_LAYOUT_K_MAJOR = 1
 
