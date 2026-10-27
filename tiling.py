@@ -189,7 +189,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
 
     # ─── Safety clamp: real DB_EN bank must hold input + FULL output ───
     # The RTL output buffer accumulates ALL out_c channels before the per-tile
-    # store (writeback indexes by oc_group*ARRAY_SIZE; store fires on tile_done
+    # store (writeback indexes by the active row output group; store fires on tile_done
     # after the last oc_group). The tile_oc budget above only constrains the
     # WEIGHT buffer and can under-size the output buffer for per-OC-reload
     # layers (out_c > tile_oc), overflowing the single DB_EN bank and dropping
