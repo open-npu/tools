@@ -231,11 +231,12 @@ def n_wgt_words(layer):
         return 0  # no weights
 
 def wgt_per_oc_words(layer):
-    """Per-oc_group weight words (ARRAY_SIZE channels × k_depth).
-    Returns 0 if all weights fit in WGT_DEPTH (no per-oc reload needed).
-    Falls back to 8-channel sub-groups when the 16-channel block itself
-    overflows the weight SRAM (e.g. Conv 3x3x512 INT16: 36864w > 24576w);
-    the RTL infers the 8-channel group size from the block size."""
+    """Weight words in one resident output-channel group.
+
+    K-major dense Conv/FC uses the widest power-of-two group up to 64 channels
+    that fits the 80KB weight SRAM. RTL derives the same width from K and the
+    data type. Returns zero when the complete layer is resident.
+    """
     if layer.op_type != OP_CONV2D and layer.op_type != OP_FC:
         return 0  # DW conv and others: no per-oc reload
     WGT_DEPTH = 20480  # WGT_KB * 256, 80KB
@@ -244,11 +245,12 @@ def wgt_per_oc_words(layer):
         return 0  # all fit, no reload needed
     eb = elem_bytes(layer)
     kd_bytes = layer.kernel_h * layer.kernel_w * layer.in_c * eb
-    # A K-major blob is grouped by 64 output channels and the 64-lane row
-    # iterates the same groups, so the reload unit has to be one whole group.
-    # 16- or 8-channel blocks would cut a group in half.
     if getattr(layer, 'wgt_layout', 0) == 1:
-        return (64 * kd_bytes + 3) // 4
+        for group_ch in (64, 32, 16, 8, 4, 2, 1):
+            group_words = (group_ch * kd_bytes + 3) // 4
+            if group_words <= WGT_DEPTH:
+                return group_words
+        return (kd_bytes + 3) // 4
     # Per-oc: ARRAY_SIZE × k_depth × elem_bytes / 4
     per_oc16 = (16 * kd_bytes + 3) // 4
     if per_oc16 <= WGT_DEPTH:
