@@ -283,8 +283,11 @@ def pick_wgt_layout(cfg, profile, bits):
     if k_depth == 0:
         return WGT_LAYOUT_OC_MAJOR
     one_oc = k_depth * elem
-    return (WGT_LAYOUT_K_MAJOR if one_oc <= profile.weight_buf_size
-            else WGT_LAYOUT_OC_MAJOR)
+    if one_oc > profile.weight_buf_size:
+        raise ValueError(
+            f"Dense K vector ({one_oc} bytes per output channel) exceeds "
+            f"the {profile.weight_buf_size}-byte row weight buffer")
+    return WGT_LAYOUT_K_MAJOR
 
 
 def row_group_channels(cfg, profile, bits):

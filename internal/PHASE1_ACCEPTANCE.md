@@ -11,8 +11,9 @@ a revision for a Phase-1 tag.
 
 ## Frozen hardware profile
 
-- Array: 16×16
-- Scratchpad: 192 KiB
+- Dense engine: one 64-MAC row
+- Depthwise engine: 8 parallel channels
+- Scratchpad: 164 KiB (24 KiB IFM + 48 KiB OFM + 80 KiB weights + 12 KiB params)
 - Accumulator: 44 bits
 - Activation/weight modes: signed INT8 and signed INT16
 - NPU1 fixed descriptor size: 62 bytes

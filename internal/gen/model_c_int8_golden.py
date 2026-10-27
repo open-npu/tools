@@ -144,8 +144,8 @@ def main():
     layers, weight_blob = read_npu1(model_bin)
     print(f"  {len(layers)} layers, weight blob {len(weight_blob)} bytes")
 
-    # Pad the final layer's out_c up to a word-aligned multiple so the systolic
-    # writeback (which packs 4 int8 per SRAM word) doesn't misalign/corrupt the
+    # Pad the final layer's out_c up to a word-aligned multiple so the packed
+    # SRAM writeback doesn't misalign/corrupt the
     # output. out_c=18 makes every pixel's byte offset p*18 non-word-aligned, and
     # the word-granular writeback overwrites neighbouring channels (the L16 bug).
     # Padding to 20 (zero-weight + zero-param channels) keeps the real channels'

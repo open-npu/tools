@@ -3,7 +3,7 @@
 Open-NPU Cycle-Level Performance Estimator
 
 Estimates per-layer and total inference cycles based on:
-  - Hardware: 16x16 systolic array (256 MACs/cycle), 32KB+32KB+64KB SRAM
+  - Hardware: 64-MAC dense row, 8-lane depthwise bank, and configured SRAMs
   - Tiling from tiling.py
   - Layer configs from onnx_converter or manual specification
 
@@ -30,12 +30,12 @@ from hw_config import HWConfig as HWProfile, DEFAULT_HW, add_hw_args, hw_config_
 
 @dataclass
 class HWConfig:
-    array_size: int = 16          # Systolic array dimension (16x16)
-    macs_per_cycle: int = 256     # 16*16 = 256 MACs/cycle
-    act_bank_bytes: int = 32768   # 32KB per activation bank
-    weight_buf_bytes: int = 65536 # 64KB weight buffer
+    mac_lanes: int = 64           # Dense products issued per cycle
+    macs_per_cycle: int = 64
+    act_bank_bytes: int = 24576   # 24KB IFM bank
+    weight_buf_bytes: int = 81920 # 80KB weight buffer
     ext_bw_bytes: int = 4         # 32-bit bus @NPU clock = 4 bytes/cycle
-    dw_parallel_ch: int = 16      # DW conv parallel channels
+    dw_parallel_ch: int = 8       # DW conv parallel channels
     elem_size: int = 1            # 1=INT8, 2=INT16
     double_buffer: bool = True    # Enable ping-pong overlap
     adaptive_db: bool = False     # Adaptive: per-layer best of single/double buffer
@@ -44,7 +44,7 @@ class HWConfig:
     def from_hw(cls, hw: HWProfile, elem_size: int = 1,
                 double_buffer: bool = True, adaptive_db: bool = False):
         return cls(
-            array_size=hw.array_size,
+            mac_lanes=hw.mac_lanes,
             macs_per_cycle=hw.macs_per_cycle,
             act_bank_bytes=hw.act_bank_size,
             weight_buf_bytes=hw.weight_buf_size,
@@ -110,15 +110,8 @@ def estimate_conv(layer, tiling, hw):
         tile_oc = 1
     oc_groups = _ceil_div(out_c, tile_oc)
 
-    # Utilization: array maps in_c → columns, tile_oc → rows
-    util_ic = min(in_c, hw.array_size) / hw.array_size
-    util_oc = min(tile_oc, hw.array_size) / hw.array_size
-    util = util_ic * util_oc
-    if util < 0.01:
-        util = 0.01
-
-    # Compute cycles
-    compute_cycles = int(math.ceil(total_macs / hw.macs_per_cycle / util))
+    # The row maps lanes across output channels and, for narrow groups, pixels.
+    compute_cycles = int(math.ceil(total_macs / hw.macs_per_cycle))
 
     # DMA per spatial tile
     kh_eff = (kh - 1) * dh + 1
@@ -201,14 +194,7 @@ def estimate_fc(layer, tiling, hw):
 
     total_macs = out_c * in_c
 
-    # Utilization
-    util_ic = min(in_c, hw.array_size) / hw.array_size
-    util_oc = min(out_c, hw.array_size) / hw.array_size
-    util = util_ic * util_oc
-    if util < 0.01:
-        util = 0.01
-
-    compute_cycles = int(math.ceil(total_macs / hw.macs_per_cycle / util))
+    compute_cycles = int(math.ceil(total_macs / hw.macs_per_cycle))
 
     # DMA
     dma_load_bytes = in_c * es + out_c * in_c * es  # input + weights
@@ -400,7 +386,7 @@ def estimate_layer_cycles(layer, hw):
         fn = estimators.get(layer.op_type, estimate_conv)
         # Build a temporary hw config with the specific db setting
         hw_tmp = HWConfig(
-            array_size=hw.array_size,
+            mac_lanes=hw.mac_lanes,
             macs_per_cycle=hw.macs_per_cycle,
             act_bank_bytes=hw.act_bank_bytes,
             weight_buf_bytes=hw.weight_buf_bytes,
@@ -567,10 +553,7 @@ def estimate_fused_block_cycles(block, fused_tiling, hw):
 
     # Conv1×1 #1: MACs = th² × c_mid × c_in (per OC group: th² × oc1_tile × c_in)
     conv1_macs = th * th * c_mid * c_in
-    util_ic1 = min(c_in, hw.array_size) / hw.array_size
-    util_oc1 = min(fused_tiling.oc1_tile, hw.array_size) / hw.array_size
-    util1 = max(util_ic1 * util_oc1, 0.01)
-    conv1_cycles = int(math.ceil(conv1_macs / hw.macs_per_cycle / util1))
+    conv1_cycles = int(math.ceil(conv1_macs / hw.macs_per_cycle))
 
     # DW 3×3: c_mid channels, output tile²
     dw_k = block.dw_kernel
@@ -579,10 +562,7 @@ def estimate_fused_block_cycles(block, fused_tiling, hw):
 
     # Conv1×1 #2: MACs = tile² × c_out × c_mid
     conv2_macs = tile_h * tile_w * c_out * c_mid
-    util_ic2 = min(c_mid, hw.array_size) / hw.array_size
-    util_oc2 = min(fused_tiling.oc2_tile, hw.array_size) / hw.array_size
-    util2 = max(util_ic2 * util_oc2, 0.01)
-    conv2_cycles = int(math.ceil(conv2_macs / hw.macs_per_cycle / util2))
+    conv2_cycles = int(math.ceil(conv2_macs / hw.macs_per_cycle))
 
     per_tile_compute = conv1_cycles + dw_cycles + conv2_cycles
 

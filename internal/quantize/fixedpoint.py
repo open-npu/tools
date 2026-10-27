@@ -446,7 +446,7 @@ def main():
     print("\n" + "-" * 60)
     print("HARDWARE NOTES:")
     print("  Requantize pipeline per output channel:")
-    print("    1. acc (40-bit signed from systolic array)")
+    print("    1. acc (signed accumulator from MAC row)")
     print("    2. + bias_q (pre-quantized to acc scale, 40-bit add)")
     print("    3. * M (15-bit unsigned multiplier → 55-bit product)")
     print("    4. + (1 << (S-1)) (rounding)")

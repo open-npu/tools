@@ -251,11 +251,9 @@ def wgt_per_oc_words(layer):
             if group_words <= WGT_DEPTH:
                 return group_words
         return (kd_bytes + 3) // 4
-    # Per-oc: ARRAY_SIZE × k_depth × elem_bytes / 4
-    per_oc16 = (16 * kd_bytes + 3) // 4
-    if per_oc16 <= WGT_DEPTH:
-        return per_oc16
-    return (8 * kd_bytes + 3) // 4
+    raise ValueError(
+        "Dense OC-major weights target the retired array engine; "
+        "regenerate the model with K-major weights")
 
 def n_param_words(layer):
     """Per-channel params: 14 bytes each, packed into uint32 words."""

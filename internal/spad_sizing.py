@@ -31,7 +31,7 @@ from tiling import compute_tiling
 def spad_profile(spad_kb):
     """HWConfig matching what npu_top.v derives from SPAD_KB."""
     return HWConfig(
-        array_size=16,
+        mac_lanes=64,
         act_bank_size=spad_kb * 256,
         weight_buf_size=spad_kb * 512,
         param_sram_max_ch=(spad_kb * 64) // 14,
