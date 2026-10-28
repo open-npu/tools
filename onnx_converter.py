@@ -1646,6 +1646,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         # Per-tile store: set when tiling says it's needed (tiled + DB_EN)
         if tile.get('per_tile_store_en', False):
             cfg.sched_ctrl |= SCHED_CTRL_PER_TILE_STORE
+        if cfg.sched_ctrl & SCHED_CTRL_DB_EN:
+            db_count += 1
         if tile['tile_num_h'] > 0:
             tiled_count += 1
     print(f"\n=== Tiling: {tiled_count}/{len(npu_layers)} layers need tiling ===")
@@ -1695,7 +1697,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     elif no_fuse:
         print(f"=== Fusion: DISABLED (no_fuse=True) — all layers independent ===")
     else:
-        print(f"=== Fusion: no fusible blocks detected ===")
+        print(f"=== Fusion: no RTL-supported untiled blocks selected ===")
 
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")

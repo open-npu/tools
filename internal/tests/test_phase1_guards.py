@@ -89,6 +89,17 @@ class Phase1GuardTests(unittest.TestCase):
                 kernel_h=1, kernel_w=1, elem_size=1,
             )
 
+    def test_activation_double_buffer_does_not_halve_weight_capacity(self):
+        common = dict(
+            op_type="conv",
+            in_h=28, in_w=28, in_c=128,
+            out_h=28, out_w=28, out_c=128,
+            kernel_h=3, kernel_w=3, elem_size=1,
+        )
+        single = compute_tiling(double_buffer=False, **common)
+        double = compute_tiling(double_buffer=True, **common)
+        self.assertEqual(double["tile_oc"], single["tile_oc"])
+
     def test_global_depthwise_uses_streaming_exception(self):
         result = compute_tiling(
             "dw", 14, 14, 512, 1, 1, 512,
