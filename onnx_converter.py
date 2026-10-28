@@ -1339,6 +1339,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 clamp_min=qmin, clamp_max=qmax,
                 in_zp=int(zp_in),
             )
+            cfg.wgt_layout = pick_wgt_layout(cfg, profile, bits)
             if bits == 16:
                 cfg.post_ctrl |= POST_INT16_OUT
             if op.get('relu6'):
