@@ -20,6 +20,12 @@ from model_packer import (
 from tiling import compute_tiling
 from extract_npu1_layers import LayerConfig as ExtractedLayerConfig
 from bin2golden import wgt_per_oc_words
+from perf_model import (
+    HWConfig as PerfHWConfig,
+    model_a_layers,
+    run_perf_model,
+    run_perf_model_with_fusion,
+)
 
 
 def node(op_type, inputs=None, outputs=None, attrs=None, weight=None):
@@ -138,6 +144,17 @@ class Phase1GuardTests(unittest.TestCase):
             wgt_layout=WGT_LAYOUT_K_MAJOR,
         )
         self.assertEqual(wgt_per_oc_words(cfg), 8192)
+
+    def test_fusion_estimator_rejects_slow_blocks(self):
+        layers = model_a_layers()
+        hw = PerfHWConfig(elem_size=1, double_buffer=True, adaptive_db=True)
+        baseline = run_perf_model(layers, hw)
+        optimized, selected = run_perf_model_with_fusion(layers, hw)
+        self.assertEqual(selected, [])
+        self.assertEqual(
+            sum(result["layer_cycles"] for result in optimized),
+            sum(result["layer_cycles"] for result in baseline),
+        )
 
 
 if __name__ == "__main__":

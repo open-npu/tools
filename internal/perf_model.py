@@ -546,7 +546,6 @@ def estimate_fused_block_cycles(block, fused_tiling, hw):
     c_in = block.c_in
     c_mid = block.c_mid
     c_out = block.c_out
-    spatial = block.spatial
     es = hw.elem_size
 
     # ─── Compute cycles per spatial tile ───
@@ -599,7 +598,7 @@ def estimate_fused_block_cycles(block, fused_tiling, hw):
                         + per_tile_compute
                         + num_tiles * per_tile_store)
 
-    total_macs = conv1_macs + dw_macs + conv2_macs
+    total_macs = (conv1_macs + dw_macs + conv2_macs) * num_tiles
     bottleneck = 'compute' if per_tile_compute >= per_tile_load else 'memory'
 
     return {
@@ -616,35 +615,45 @@ def estimate_fused_block_cycles(block, fused_tiling, hw):
 
 
 def run_perf_model_with_fusion(layers, hw):
-    """Run performance estimation with super-layer fusion.
+    """Run performance estimation with profitable super-layer fusion.
 
     Detects fusible blocks, estimates them as single fused units,
-    and estimates remaining layers individually.
+    and keeps a block fused only when its estimated cycles beat the
+    independently scheduled layers. This matters when spatial fusion
+    saves activation traffic but duplicates halo compute and weight DMA.
     """
-    blocks = detect_fusible_blocks(layers)
-
-    # Mark which layers are part of fused blocks
-    fused_layer_set = set()
-    for block in blocks:
-        for idx in range(block.start_idx, block.end_idx + 1):
-            fused_layer_set.add(idx)
+    candidates = detect_fusible_blocks(layers)
+    selected = []
 
     results = []
-    block_iter = iter(blocks)
+    block_iter = iter(candidates)
     next_block = next(block_iter, None)
 
     i = 0
     while i < len(layers):
         if next_block and i == next_block.start_idx:
-            # Estimate as fused block
             ft = compute_fused_tiling(next_block, elem_size=hw.elem_size)
-            r = estimate_fused_block_cycles(next_block, ft, hw)
-            if r:
-                r['layer_idx'] = i
-                r['op_type'] = 'FUSED'
-                r['dims'] = (f"{next_block.spatial}x{next_block.spatial}x"
-                             f"{next_block.c_in}→{next_block.c_mid}→{next_block.c_out}")
-                results.append(r)
+            fused = estimate_fused_block_cycles(next_block, ft, hw)
+            separate = []
+            for layer_idx in range(next_block.start_idx, next_block.end_idx + 1):
+                r = estimate_layer_cycles(layers[layer_idx], hw)
+                r['layer_idx'] = layer_idx
+                r['op_type'] = layers[layer_idx].op_type
+                r['dims'] = (f"{layers[layer_idx].out_h}x"
+                             f"{layers[layer_idx].out_w}x"
+                             f"{layers[layer_idx].out_c}")
+                r['fused'] = False
+                separate.append(r)
+
+            if fused and fused['layer_cycles'] < sum(r['layer_cycles'] for r in separate):
+                fused['layer_idx'] = i
+                fused['op_type'] = 'FUSED'
+                fused['dims'] = (f"{next_block.out_h}x{next_block.out_w}x"
+                                 f"{next_block.c_in}→{next_block.c_mid}→{next_block.c_out}")
+                results.append(fused)
+                selected.append(next_block)
+            else:
+                results.extend(separate)
             i = next_block.end_idx + 1
             next_block = next(block_iter, None)
         else:
@@ -657,7 +666,7 @@ def run_perf_model_with_fusion(layers, hw):
             results.append(r)
             i += 1
 
-    return results, blocks
+    return results, selected
 
 
 # ─── Built-in MODEL_A MobileNetV2 ───
@@ -815,7 +824,7 @@ def main():
               f"({'INT16' if hw.elem_size == 2 else 'INT8'}, BW={hw.ext_bw_bytes}B/cyc)")
         print(f"{'='*100}")
 
-        print(f"\n  Detected fusible blocks: {len(blocks)}")
+        print(f"\n  Selected profitable fused blocks: {len(blocks)}")
         if blocks:
             print(f"\n  {'#':>3} | {'Layers':>8} | {'Spatial':>7} | {'Channels':>14} | "
                   f"{'Tile':>6} | {'Tiles':>5}")
@@ -824,7 +833,7 @@ def main():
                 ft = compute_fused_tiling(blk, elem_size=hw.elem_size)
                 ch = f"{blk.c_in}→{blk.c_mid}→{blk.c_out}"
                 print(f"  {idx:>3} | {blk.start_idx:>2}-{blk.end_idx:<4} | "
-                      f"{blk.spatial:>3}×{blk.spatial:<3} | {ch:>14} | "
+                      f"{blk.out_h:>3}×{blk.out_w:<3} | {ch:>14} | "
                       f"{ft.tile_h:>2}×{ft.tile_w:<2} | {ft.spatial_tiles:>5}")
 
         print(f"\n  {'Entry':>5} | {'Type':>5} | {'Dims':>24} | {'Cycles':>10} | {'Bottleneck':>10}")
@@ -841,7 +850,7 @@ def main():
         print(f"    Baseline (adaptive, no fusion):  {total_baseline:>12,} cycles")
         print(f"    With super-layer fusion:         {total_fused:>12,} cycles")
         print(f"    Speedup:                         {speedup:>11.2f}x")
-        print(f"    Fused blocks:                    {len(blocks)}")
+        print(f"    Profitable fused blocks:         {len(blocks)}")
 
         # DMA savings
         baseline_dma = sum(r['dma_load_cycles'] + r['dma_store_cycles']
