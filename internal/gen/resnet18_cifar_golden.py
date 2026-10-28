@@ -7,6 +7,8 @@ import os, sys, numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'tests')))
 
 from onnx_converter import convert_model
 from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes
@@ -56,7 +58,7 @@ def main():
     os.makedirs(GOLDEN_OUT, exist_ok=True)
 
     # Build ResNet-18 CIFAR model
-    from test_resnet18_e2e import make_resnet18_model
+    from resnet18_e2e import make_resnet18_model
     print("Step 1: Build ResNet-18 CIFAR (32x32x3, 10-class)")
     model = make_resnet18_model(num_classes=10, input_size=32)
     model_path = os.path.join(WORK_DIR, 'resnet18_cifar.onnx')

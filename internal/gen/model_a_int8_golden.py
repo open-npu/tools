@@ -11,7 +11,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
 import struct, shutil
-from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes
+from bin2golden import (
+    read_npu1, generate_golden, pack_input_to_words, pack_output_to_words,
+    n_output_words, elem_bytes, wgt_per_oc_words,
+)
 from tiling import compute_tiling
 from hw_config import DEFAULT_HW
 
@@ -225,21 +228,7 @@ def main():
     # Step 6: Post-process — add wgt_per_oc_words, pack outputs from CSIM dumps
 
     for i, m in enumerate(md):
-        # Add wgt_per_oc_words
-        if m['op_type'] == 0 or m['op_type'] == 2:  # Conv2D/FC
-            wgt_words = m['dma_wgt_size'] // 4
-            if wgt_words > 20480:
-                kd = m.get('kernel_h', 1) * m.get('kernel_w', 1) * m['in_c']
-                eb = 2 if m.get('data_type', 0) == 1 else 1  # bytes per element
-                per_oc = (16 * kd * eb + 3) // 4
-                if per_oc > 20480:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
-                    per_oc = (8 * kd * eb + 3) // 4
-                m['wgt_per_oc_words'] = per_oc
-                print(f"  L{i}: wgt overflow {wgt_words} > 20480, per_oc={per_oc}")
-            else:
-                m['wgt_per_oc_words'] = 0
-        else:
-            m['wgt_per_oc_words'] = 0
+        m['wgt_per_oc_words'] = wgt_per_oc_words(layers[i])
 
         # Update input/output from CSIM dumps
         if i in csim_outputs:

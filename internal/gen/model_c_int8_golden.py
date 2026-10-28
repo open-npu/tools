@@ -16,7 +16,10 @@ from PIL import Image
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
-from bin2golden import read_npu1, generate_golden, pack_input_to_words, pack_output_to_words, n_output_words, elem_bytes, OP_ELTWISE_ADD
+from bin2golden import (
+    read_npu1, generate_golden, pack_input_to_words, pack_output_to_words,
+    n_output_words, elem_bytes, OP_ELTWISE_ADD, wgt_per_oc_words,
+)
 from model_packer import PerChannelParam
 
 ONNX_PATH = '/tmp/npu_yolo_output_small__uoinc2r/model_single.onnx'
@@ -261,20 +264,7 @@ def main():
 
     # Step 5d: Add wgt_per_oc_words
     for i, m in enumerate(md):
-        if m['op_type'] == 0 or m['op_type'] == 2:
-            wgt_words = m['dma_wgt_size'] // 4
-            if wgt_words > 20480:
-                kd = m.get('kernel_h', 1) * m.get('kernel_w', 1) * m['in_c']
-                eb = 2 if m.get('data_type', 0) == 1 else 1  # bytes per element
-                per_oc = (16 * kd * eb + 3) // 4
-                if per_oc > 20480:  # 16-ch block overflows WGT SRAM (e.g. 3x3x512 int16): use 8-ch sub-groups
-                    per_oc = (8 * kd * eb + 3) // 4
-                m['wgt_per_oc_words'] = per_oc
-                print(f"  L{i}: wgt overflow {wgt_words} > 20480, per_oc={per_oc}")
-            else:
-                m['wgt_per_oc_words'] = 0
-        else:
-            m['wgt_per_oc_words'] = 0
+        m['wgt_per_oc_words'] = wgt_per_oc_words(layers[i])
 
     with open(meta_path, 'w') as f:
         json.dump(md, f, indent=2)

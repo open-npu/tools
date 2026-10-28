@@ -19,6 +19,7 @@ from model_packer import (
 )
 from tiling import compute_tiling
 from extract_npu1_layers import LayerConfig as ExtractedLayerConfig
+from bin2golden import wgt_per_oc_words
 
 
 def node(op_type, inputs=None, outputs=None, attrs=None, weight=None):
@@ -128,6 +129,15 @@ class Phase1GuardTests(unittest.TestCase):
         self.assertEqual((decoded.clamp_min, decoded.clamp_max), (-1234, 2345))
         self.assertEqual(decoded.in_zp, -7)
         self.assertEqual(decoded.wgt_layout, WGT_LAYOUT_K_MAJOR)
+
+    def test_fc_reload_stride_uses_64_lane_row_group(self):
+        cfg = PackedLayerConfig(
+            op_type=2, data_type=0,
+            in_h=1, in_w=1, in_c=512,
+            out_h=1, out_w=1, out_c=1000,
+            wgt_layout=WGT_LAYOUT_K_MAJOR,
+        )
+        self.assertEqual(wgt_per_oc_words(cfg), 8192)
 
 
 if __name__ == "__main__":
