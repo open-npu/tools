@@ -275,18 +275,20 @@ _PTS = 1 << 4
 
 
 def stamp_fused_tiling(layers, block: FusedBlock, tiling: FusedTiling,
-                       include_add: bool = True) -> int:
+                       include_add: bool = True, allow_tiled: bool = False) -> int:
     """Write one tile grid onto every layer of an IR block.
 
     START / MID / END (and a following residual Add with the same spatial
     size) share tile_h/w/num. DMA double-buffer is cleared so fusion can
     use the two native act regions. If the whole map fits in one tile,
     tiles are cleared (tile_h=0) so the existing untiled skip-DMA path
-    can fire.
+    can fire. Tiled fusion is rejected by default because the RTL executes
+    every tile of START before MID; it cannot keep one tile resident through
+    START→MID→END yet.
 
     Returns the number of layers stamped.
     """
-    if not tiling.feasible:
+    if not tiling.feasible or (tiling.spatial_tiles > 1 and not allow_tiled):
         return 0
 
     idxs = [block.start_idx, block.start_idx + 1, block.end_idx]
@@ -623,7 +625,9 @@ if __name__ == '__main__':
                      c_in=56, c_mid=112, c_out=56, dw_kernel=3, dw_stride=1)
     ft = compute_fused_tiling(blk)
     assert ft.feasible
-    n = stamp_fused_tiling(stamped, blk, ft)
+    assert stamp_fused_tiling(stamped, blk, ft) == 0, \
+        "tiled fusion must stay disabled until RTL executes tile-major blocks"
+    n = stamp_fused_tiling(stamped, blk, ft, allow_tiled=True)
     assert n == 4, f"expected 4 stamped layers, got {n}"
     grids = [(s['tile_h'], s['tile_w'], s['tile_num_h'], s['tile_num_w']) for s in stamped]
     assert len(set(grids)) == 1, f"grids diverged: {grids}"

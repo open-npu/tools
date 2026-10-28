@@ -25,7 +25,8 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         stride_h, stride_w: stride
         dilation_h, dilation_w: dilation
         elem_size: bytes per element (1=INT8, 2=INT16)
-        double_buffer: if True, use half-buffer sizes (ping/pong mode)
+        double_buffer: if True, use half activation-bank capacity (ping/pong).
+                       Weight SRAM remains a single full-capacity 80KB bank.
         profile: HWProfile instance (default: NPU_FULL)
 
     Returns:
@@ -39,9 +40,11 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     if profile is None:
         profile = DEFAULT_HW
 
-    # Effective buffer sizes (halved in double-buffer mode)
+    # DB_EN ping-pongs the activation SRAM only. The RTL has one full-capacity
+    # weight SRAM and reloads each OC group at address 0; treating it as two
+    # 40KB banks creates artificial OC groups that hardware does not require.
     act_bank = profile.act_bank_size // 2 if double_buffer else profile.act_bank_size
-    weight_buf = profile.weight_buf_size // 2 if double_buffer else profile.weight_buf_size
+    weight_buf = profile.weight_buf_size
     param_max_ch = profile.param_sram_max_ch
 
     # FC doesn't do spatial tiling
