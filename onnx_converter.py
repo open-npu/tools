@@ -1574,7 +1574,9 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             print(f"    Resize[{len(npu_layers)-1}]: {mode_name} "
                   f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
 
-    # 4b. Compute tiling for each layer (adaptive: per-layer single/double buffer)
+    # 4b. Compute single-buffer tiling for each layer. Tiled PTS is serialized
+    # as store → next-input load at tile boundaries, so ping/pong cannot overlap
+    # those transfers and only halves usable activation capacity.
     op_type_names = {OP_CONV2D: 'conv', OP_DW_CONV: 'dw', OP_FC: 'fc',
                      OP_POOLING: 'pool', OP_ELTWISE_ADD: 'add',
                      OP_RESIZE: 'resize', OP_CONCAT: 'concat'}
@@ -1583,7 +1585,6 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     db_count = 0
     for cfg in npu_layers:
         op_name = op_type_names.get(cfg.op_type, 'conv')
-        # Compute tiling for both modes (single/double buffer)
         # Pool layers use pool_h/w as kernel, pool_stride as stride
         if cfg.op_type == OP_POOLING:
             eff_kh = cfg.pool_h
@@ -1606,44 +1607,14 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             double_buffer=False,
             profile=profile,
         )
-        tile_db = compute_tiling(
-            op_type=op_name,
-            in_h=cfg.in_h, in_w=cfg.in_w, in_c=cfg.in_c,
-            out_h=cfg.out_h, out_w=cfg.out_w, out_c=cfg.out_c,
-            kernel_h=eff_kh, kernel_w=eff_kw,
-            stride_h=eff_sh, stride_w=eff_sw,
-            dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
-            elem_size=elem_size,
-            double_buffer=True,
-            profile=profile,
-        )
-        # Use double-buffer tiling by default (enables overlap);
-        # fall back to single-buffer if DB causes excessive tile fragmentation
-        # Heuristic: if DB tile count > 4x SB tile count, prefer SB
-        sb_tiles = max(1, tile_sb['tile_num_h']) * max(1, tile_sb['tile_num_w'])
-        db_tiles = max(1, tile_db['tile_num_h']) * max(1, tile_db['tile_num_w'])
-        sb_oc_groups = math.ceil(cfg.out_c / tile_sb.get('tile_oc', cfg.out_c)) if tile_sb.get('tile_oc', cfg.out_c) > 0 else 1
-        db_oc_groups = math.ceil(cfg.out_c / tile_db.get('tile_oc', cfg.out_c)) if tile_db.get('tile_oc', cfg.out_c) > 0 else 1
-        sb_total = sb_tiles * sb_oc_groups
-        db_total = db_tiles * db_oc_groups
-
-        # Prefer single-buffer if it fits entirely in SRAM (no tiling) —
-        # small layers run faster without DB_EN ping-pong overhead.
-        # Also prefer SB if DB causes excessive tile fragmentation (>4x).
-        sb_fits_full = (tile_sb['tile_num_h'] == 0)  # SB no-tiling = fits full SRAM
-        if sb_fits_full:
-            tile = tile_sb
-            cfg.sched_ctrl = 0
-        else:
-            # Tiled: must use DB_EN + PTS (SB tiled can't fit full input in SRAM)
-            tile = tile_db
-            cfg.sched_ctrl = SCHED_CTRL_DB_EN
+        tile = tile_sb
+        cfg.sched_ctrl = 0
 
         cfg.tile_h = tile['tile_h']
         cfg.tile_w = tile['tile_w']
         cfg.tile_num_h = tile['tile_num_h']
         cfg.tile_num_w = tile['tile_num_w']
-        # Per-tile store: set when tiling says it's needed (tiled + DB_EN)
+        # Per-tile store preserves every spatial tile before bank-0 reuse.
         if tile.get('per_tile_store_en', False):
             cfg.sched_ctrl |= SCHED_CTRL_PER_TILE_STORE
         if cfg.sched_ctrl & SCHED_CTRL_DB_EN:
