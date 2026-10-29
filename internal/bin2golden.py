@@ -255,6 +255,28 @@ def wgt_per_oc_words(layer):
         "Dense OC-major weights target the retired array engine; "
         "regenerate the model with K-major weights")
 
+
+def use_group_major(layer, per_tile_store):
+    """Whether a tiled dense layer can reuse each OC group across all tiles.
+
+    Partial NHWC stores use 32-bit DMA words, so both the complete pixel and
+    one resident channel group must be word aligned. K-sliced groups retain
+    their inner reload protocol and are not eligible.
+    """
+    if (not per_tile_store or layer.tile_h <= 0
+            or layer.op_type != OP_CONV2D
+            or (layer.sched_ctrl & 0x1)):
+        return False
+    per_group = wgt_per_oc_words(layer)
+    if per_group == 0 or (per_group & 0x80000000):
+        return False
+    eb = elem_bytes(layer)
+    kd_bytes = layer.kernel_h * layer.kernel_w * layer.in_c * eb
+    if kd_bytes == 0 or (per_group * 4) % kd_bytes:
+        return False
+    group_ch = (per_group * 4) // kd_bytes
+    return (layer.out_c * eb) % 4 == 0 and (group_ch * eb) % 4 == 0
+
 def n_param_words(layer):
     """Per-channel params: 14 bytes each, packed into uint32 words."""
     n = len(layer.ch_params)
@@ -579,6 +601,8 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
         else:
             k_depth = 1
 
+        group_major = use_group_major(layer, pts)
+
         # Build meta entry (matching RTL test format)
         meta = {
             'op_type': layer.op_type,
@@ -612,7 +636,8 @@ def generate_golden(layers, weight_blob, input_nhwc, output_dir,
             # Per-tile store (2D DMA for NHWC DDR layout)
             'tile_out_size': (layer.tile_h * layer.tile_w * layer.out_c *
                               elem_bytes(layer)) if (pts and layer.tile_h > 0) else 0,
-            'store_mode': 1 if pts else 0,  # bit[0]=PER_TILE_STORE_EN
+            # bit[0]=PER_TILE_STORE_EN, bit[1]=OC-group outer loop
+            'store_mode': (1 | (2 if group_major else 0)) if pts else 0,
             'row_cfg': (((layer.tile_h & 0xFFFF) << 16) | ((layer.tile_w * layer.out_c *
                         elem_bytes(layer) // 4) & 0xFFFF)) if pts else 0,
             'n_input_words': n_in,

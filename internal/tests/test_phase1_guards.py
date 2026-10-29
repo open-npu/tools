@@ -19,7 +19,7 @@ from model_packer import (
 )
 from tiling import compute_tiling
 from extract_npu1_layers import LayerConfig as ExtractedLayerConfig
-from bin2golden import wgt_per_oc_words
+from bin2golden import use_group_major, wgt_per_oc_words
 from perf_model import (
     HWConfig as PerfHWConfig,
     model_a_layers,
@@ -164,6 +164,41 @@ class Phase1GuardTests(unittest.TestCase):
             wgt_layout=WGT_LAYOUT_K_MAJOR,
         )
         self.assertEqual(wgt_per_oc_words(cfg), 8192)
+
+    def test_tiled_dense_conv_enables_cross_tile_weight_reuse(self):
+        cfg = PackedLayerConfig(
+            op_type=0, data_type=0,
+            in_h=28, in_w=28, in_c=256,
+            out_h=28, out_w=28, out_c=256,
+            kernel_h=3, kernel_w=3,
+            tile_h=5, tile_w=6, tile_num_h=6, tile_num_w=5,
+            sched_ctrl=0x10, wgt_layout=WGT_LAYOUT_K_MAJOR,
+        )
+        self.assertTrue(use_group_major(cfg, per_tile_store=True))
+
+    def test_unaligned_partial_channel_store_keeps_tile_major(self):
+        cfg = PackedLayerConfig(
+            op_type=0, data_type=0,
+            in_h=8, in_w=8, in_c=20000,
+            out_h=8, out_w=8, out_c=6,
+            kernel_h=1, kernel_w=1,
+            tile_h=1, tile_w=1, tile_num_h=8, tile_num_w=8,
+            sched_ctrl=0x10, wgt_layout=WGT_LAYOUT_K_MAJOR,
+        )
+        # Only two INT8 channels fit in one resident group; a group slice is
+        # not a whole DMA word and would require per-pixel read-modify-write.
+        self.assertFalse(use_group_major(cfg, per_tile_store=True))
+
+    def test_double_buffer_keeps_tile_major_until_group_reuse_is_validated(self):
+        cfg = PackedLayerConfig(
+            op_type=0, data_type=0,
+            in_h=28, in_w=28, in_c=256,
+            out_h=28, out_w=28, out_c=256,
+            kernel_h=3, kernel_w=3,
+            tile_h=5, tile_w=6, tile_num_h=6, tile_num_w=5,
+            sched_ctrl=0x11, wgt_layout=WGT_LAYOUT_K_MAJOR,
+        )
+        self.assertFalse(use_group_major(cfg, per_tile_store=True))
 
     def test_fusion_estimator_rejects_slow_blocks(self):
         layers = model_a_layers()
