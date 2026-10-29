@@ -33,9 +33,9 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         dict with keys: tile_h, tile_w, tile_num_h, tile_num_w, tile_oc,
               per_tile_store_en
               (tile_h/w = 0 and tile_num_h/w = 0 means no tiling needed)
-              per_tile_store_en: True when per-tile store to NHWC DDR is needed
-                  (tiled + double-buffer, for cascaded model inference).
-                  False for small layers (full SRAM) or single-buffer tiled.
+              per_tile_store_en: True when a spatially tiled layer must store
+                  each tile to NHWC DDR before its SRAM region is reused.
+                  False only when the full output remains resident.
     """
     if profile is None:
         profile = DEFAULT_HW
@@ -85,7 +85,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         tile_num_h = math.ceil(out_h / tile_h)
         return {'tile_h': tile_h, 'tile_w': out_w,
                 'tile_num_h': tile_num_h, 'tile_num_w': 1,
-                'tile_oc': out_c, 'per_tile_store_en': double_buffer}
+                'tile_oc': out_c, 'per_tile_store_en': True}
 
     # Effective kernel size (with dilation)
     kh_eff = (kernel_h - 1) * dilation_h + 1
@@ -236,15 +236,15 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
                 'tile_oc': out_c, 'per_tile_store_en': False}
 
-    # Tiled layer: per_tile_store_en only for double-buffer mode (cascaded inference)
-    # Single-buffer tiled layers keep last-tile-only store (no cascade)
+    # Every spatial tile must be stored before the next tile reuses OFM SRAM.
+    # The controller supports this in both ping/pong and single-buffer modes.
     return {
         'tile_h': tile_h,
         'tile_w': tile_w,
         'tile_num_h': tile_num_h,
         'tile_num_w': tile_num_w,
         'tile_oc': tile_oc,
-        'per_tile_store_en': double_buffer,
+        'per_tile_store_en': True,
     }
 
 

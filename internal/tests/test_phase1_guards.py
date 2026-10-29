@@ -100,6 +100,15 @@ class Phase1GuardTests(unittest.TestCase):
         double = compute_tiling(double_buffer=True, **common)
         self.assertEqual(double["tile_oc"], single["tile_oc"])
 
+    def test_single_buffer_spatial_tile_requires_per_tile_store(self):
+        result = compute_tiling(
+            "conv", 28, 28, 512, 28, 28, 512,
+            kernel_h=3, kernel_w=3, elem_size=1,
+            double_buffer=False,
+        )
+        self.assertGreater(result["tile_num_h"] * result["tile_num_w"], 1)
+        self.assertTrue(result["per_tile_store_en"])
+
     def test_global_depthwise_uses_streaming_exception(self):
         result = compute_tiling(
             "dw", 14, 14, 512, 1, 1, 512,
