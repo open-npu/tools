@@ -46,8 +46,8 @@ def pack_conv_pool_fuse_strips(input_nhwc, conv, pool):
         conv_in_h = (producer_h - 1) * conv.stride_h + conv.kernel_h
         conv_in_w = (conv.out_w - 1) * conv.stride_w + conv.kernel_w
         conv_in_bytes = conv_in_h * conv_in_w * conv.in_c * elem_bytes
-        if (producer_bytes > 48 * 1024 or pool_out_bytes > 24 * 1024
-                or conv_in_bytes > 24 * 1024):
+        if (producer_bytes > 48 * 1024 or pool_out_bytes > 32 * 1024
+                or conv_in_bytes > 32 * 1024):
             break
         pool_strip_h = candidate
     if pool_strip_h == 0:
