@@ -84,7 +84,10 @@ def create_unfused_refit(src, dst):
         pool_sh, pool_sw = data[off + 27], data[off + 28]
         old_h = struct.unpack_from('<H', data, off + 39)[0]
         old_w = struct.unpack_from('<H', data, off + 41)[0]
-        data[off + 48] = data[off + 48] & 0x11  # keep DB_EN + PTS, drop FUSE
+        # The current DB_EN+PTS path is not safe.  Use the single-buffer PTS
+        # schedule for every tiled layer and clear all scheduling bits for
+        # untiled layers below.
+        data[off + 48] = data[off + 48] & 0x10
         eb = 2 if dt else 1
         op_name = OP_NAMES.get(op, 'conv')
         k_h, k_w, s_h, s_w = kh, kw, sh, sw
@@ -95,7 +98,7 @@ def create_unfused_refit(src, dst):
                 op_type=op_name, in_h=in_h, in_w=in_w, in_c=in_c,
                 out_h=out_h, out_w=out_w, out_c=out_c,
                 kernel_h=k_h, kernel_w=k_w, stride_h=s_h, stride_w=s_w,
-                elem_size=eb, double_buffer=True, profile=DEFAULT_HW)
+                elem_size=eb, double_buffer=False, profile=DEFAULT_HW)
         except ValueError as e:
             print(f"  L{i}: tile refit failed ({e}), keeping {old_h}x{old_w}")
             tile = None
@@ -109,7 +112,7 @@ def create_unfused_refit(src, dst):
             if new_h == 0:
                 data[off + 48] = data[off + 48] & ~0x11  # no DB/PTS if untiled
             elif tile.get('per_tile_store_en'):
-                data[off + 48] = data[off + 48] | 0x11
+                data[off + 48] = (data[off + 48] & ~0x0F) | 0x10
         param_ch_count = struct.unpack_from('<H', data, off + 55)[0]
         has_lut = data[off + 57]
         has_add = data[off + 58]
@@ -205,12 +208,11 @@ def main():
         meta['ddr_out_addr'] = meta['ddr_out_addr'] + in_b_size_align
         print(f"  L{idx:2d} Add: add_b_addr=0x{meta['ddr_add_b_addr']:08X}")
 
-    # Step 5c: Patch per-tile store for DB_EN + tiled layers
+    # Step 5c: Patch per-tile store for single-buffer tiled layers
     for i, m in enumerate(md):
-        db_en = m['sched_ctrl'] & 1
         has_tile = m.get('tile_h', 0) > 0 and m.get('tile_w', 0) > 0
-        if db_en and has_tile:
-            m['sched_ctrl'] = m['sched_ctrl'] | 0x10  # Set PTS bit
+        if has_tile:
+            m['sched_ctrl'] = (m['sched_ctrl'] & ~0x0F) | 0x10
             m['store_mode'] = 1  # PER_TILE_STORE_EN
             eb = 2 if m.get('post_ctrl', 0) & 0x80 else 1  # INT16_OUT
             tile_h = m['tile_h']

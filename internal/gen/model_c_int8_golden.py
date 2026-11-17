@@ -20,7 +20,10 @@ from bin2golden import (
     read_npu1, generate_golden, pack_input_to_words, pack_output_to_words,
     n_output_words, elem_bytes, OP_ELTWISE_ADD, wgt_per_oc_words,
 )
-from model_packer import PerChannelParam
+from model_packer import (
+    PerChannelParam, WGT_LAYOUT_K_MAJOR,
+    conv_weights_from_blob, conv_weights_to_blob,
+)
 
 ONNX_PATH = '/tmp/npu_yolo_output_small__uoinc2r/model_single.onnx'
 WORK_DIR = '/tmp/model_c_int8_golden'
@@ -163,12 +166,26 @@ def main():
         new_oc = ((last.out_c * elem_sz + 3) // 4 * 4) // elem_sz
         pad_ch = new_oc - last.out_c
         print(f"  L{len(layers)-1}: pad out_c {last.out_c} -> {new_oc} (+{pad_ch} ch) for writeback alignment")
+        orig_oc = last.out_c
         for _ in range(pad_ch):
             last.ch_params.append(PerChannelParam(M=0, S=0, zp=0, bias_q=0))
-        # The final layer's weights are at the end of the blob — append zero channels.
+        # The final layer is K-major: pad each K row, not the end of the blob.
         wbytes_per_ch = last.kernel_h * last.kernel_w * last.in_c * elem_sz
-        weight_blob = weight_blob + bytes(pad_ch * wbytes_per_ch)
-        padded_last_oc = (last.out_c, new_oc)
+        old_size = orig_oc * wbytes_per_ch
+        old_blob = weight_blob[-old_size:]
+        old_weights = conv_weights_from_blob(
+            old_blob, WGT_LAYOUT_K_MAJOR, orig_oc,
+            last.kernel_h, last.kernel_w, last.in_c, np.int8)
+        padded_weights = np.zeros(
+            (new_oc, last.kernel_h, last.kernel_w, last.in_c), dtype=np.int8)
+        padded_weights[:orig_oc] = old_weights
+        assert np.array_equal(padded_weights[:orig_oc], old_weights)
+        assert not np.any(padded_weights[orig_oc:])
+        weight_blob = (
+            weight_blob[:-old_size]
+            + conv_weights_to_blob(padded_weights, WGT_LAYOUT_K_MAJOR)
+        )
+        padded_last_oc = (orig_oc, new_oc)
         last.out_c = new_oc
 
     # Step 3: Prepare input (use converter-generated INT8 input)

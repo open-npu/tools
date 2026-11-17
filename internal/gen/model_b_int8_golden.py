@@ -36,6 +36,7 @@ sys.path.insert(0, INTERNAL)
 
 from onnx_converter import convert_model
 from model_packer import pack_model, LayerConfig, OP_ELTWISE_ADD
+from hw_config import DEFAULT_HW
 from bin2golden import (
     read_npu1, generate_golden, pack_input_to_words, pack_output_to_words,
     n_output_words, n_full_input_words, n_input_words, elem_bytes,
@@ -73,6 +74,43 @@ def pack_last_tile_output(output_nhwc, layer):
         padded = np.zeros(n_words * 2, dtype=np.uint16)
         padded[:len(flat_u16)] = flat_u16
         return padded.view('<u4')
+
+
+def pack_conv_pool_fuse_strips(input_nhwc, conv, pool_strip_h=6):
+    """Pack padded L0 input strips for firmware-driven Conv→Pool fusion.
+
+    A pool strip of ``pool_strip_h`` rows consumes ``2*h+1`` L0 rows.
+    Recomputing the one-row overlap lets each L0 invocation produce one
+    contiguous SRAM tensor that the existing untiled fusion path can hand
+    directly to L1.
+    """
+    producer_h = 2 * pool_strip_h + 1
+    producer_w = conv.out_w
+    input_h = (producer_h - 1) * conv.stride_h + conv.kernel_h
+    input_w = (producer_w - 1) * conv.stride_w + conv.kernel_w
+    strip_count = (28 + pool_strip_h - 1) // pool_strip_h
+    pad_value = -conv.in_zp
+
+    # Padded coordinates make producer output (0,0) start at padded (0,0).
+    # Extend the bottom for the fixed-size final producer strip; L1 clips that
+    # strip to the four remaining output rows and never consumes the excess.
+    strip_input_step = pool_strip_h * 2 * conv.stride_h
+    padded_h = max((strip_count - 1) * strip_input_step + input_h,
+                   conv.pad_top + conv.in_h)
+    padded_w = max(input_w, conv.pad_left + conv.in_w)
+    padded = np.full((padded_h, padded_w, conv.in_c), pad_value,
+                     dtype=input_nhwc.dtype)
+    padded[conv.pad_top:conv.pad_top + conv.in_h,
+           conv.pad_left:conv.pad_left + conv.in_w, :] = input_nhwc
+
+    strips = []
+    for strip in range(strip_count):
+        row = strip * strip_input_step
+        flat = padded[row:row + input_h, :input_w, :].reshape(-1)
+        packed = np.zeros((flat.size + 3) // 4 * 4, dtype=np.uint8)
+        packed[:flat.size] = flat.astype(np.uint8)
+        strips.append(packed.view('<u4'))
+    return np.concatenate(strips)
 
 # ─── Paths ───
 MODEL_PATH = '/data/sam/model_b/WXPay_PalmIrLiveness_624_06_r20260509.onnx'
@@ -202,6 +240,10 @@ def main():
 
     metadata = generate_golden(layers, weight_blob, input_nhwc, GOLDEN_OUT,
                                base_ddr_addr=0x30000000, layer_offset=0x00010000)
+    fuse_input = pack_conv_pool_fuse_strips(input_nhwc, layers[0])
+    np.save(os.path.join(GOLDEN_OUT, 'layer_00_fuse_input.npy'), fuse_input)
+    print(f"  L0→L1 fuse input: {len(fuse_input)} words "
+          f"({len(fuse_input) // 5} words/strip × 5)")
 
     # ─── Step 4: Add input_b DDR addresses for Add layers ───
     # For each Add layer, allocate a region for residual input_b within
@@ -288,7 +330,50 @@ def main():
             print(f"  L{idx:2d} Add: saved input_b from L{layer.residual_src} "
                   f"({len(in_b_words)} words)")
 
-    # ─── Step 6: Rewrite metadata.json with patched ddr_add_b_addr ───
+    # Fusion changes only RTL scheduling, not the mathematical graph.  Stamp
+    # it after CSIM because the software model intentionally rejects hardware
+    # SRAM-lifetime flags in a full-model run.
+    fuse_pairs = ((13, 14), (16, 17), (20, 21), (23, 24))
+    for start, end in fuse_pairs:
+        a, b = layers[start], layers[end]
+        if a.tile_h != 0 or b.tile_h != 0 or b.input_src >= 0:
+            raise RuntimeError(f"L{start}->L{end} is not a safe untiled chain")
+        a.sched_ctrl |= 0x02  # FUSE_START
+        b.sched_ctrl |= 0x08  # FUSE_END
+        metadata[start]['sched_ctrl'] = a.sched_ctrl
+        metadata[end]['sched_ctrl'] = b.sched_ctrl
+    print(f"  SRAM fuse pairs: {list(fuse_pairs)}")
+
+    retiled = plan_db_tiles(layers, metadata)
+    if retiled:
+        for idx, th, tw, old_t, new_t in retiled:
+            print(f"  L{idx:2d}: re-tiled to {th}x{tw} "
+                  f"(input words {old_t} -> {new_t})")
+        # tile_in_size is the halo input window of one tile, word-rounded the
+        # same way the packer and DMA expect (n_input_words), not the tile
+        # area: the DMA loads ((tile_h-1)*stride_h + kernel_h) rows.
+        for idx, _, _, _, _ in retiled:
+            m = metadata[idx]
+            eb = 2 if m['data_type'] == 1 else 1
+            th, tw = m['tile_h'], m['tile_w']
+            if m['op_type'] == 3:
+                pc = m.get('pool_cfg', 0)
+                kh, kw = (pc >> 4) & 0xF, (pc >> 8) & 0xF
+                sh, sw = (pc >> 12) & 0xF, (pc >> 16) & 0xF
+            elif m['op_type'] == 4:
+                kh = kw = sh = sw = 1
+            else:
+                kh, kw = m['kernel_h'], m['kernel_w']
+                sh, sw = m['stride_h'], m['stride_w']
+            in_h = (th - 1) * sh + kh
+            in_w = (tw - 1) * sw + kw
+            m['tile_in_size'] = ((in_h * in_w * m['in_c'] + 3) // 4) * 4
+            m['tile_out_size'] = th * tw * m['out_c'] * eb
+            m['row_cfg'] = (th << 16) | ((tw * m['out_c'] * eb + 3) // 4)
+    print(f"  DB_EN layers: "
+          f"{[i for i in range(len(metadata)) if metadata[i]['sched_ctrl'] & 1]}")
+
+    # ─── Step 6: Rewrite metadata.json with patched scheduling/addresses ───
     import json
     with open(os.path.join(GOLDEN_OUT, 'metadata.json'), 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -307,7 +392,6 @@ def main():
     print(f"  Add layers: {len(add_layers)} → {add_layers}")
 
     # Verify tiling fits bank
-    from hw_config import DEFAULT_HW
     act_bank_w = DEFAULT_HW.act_bank_size // 4  # bytes → words
     print(f"\n  Bank check (act_bank={act_bank_w} words):")
     ok = True
@@ -325,6 +409,109 @@ def main():
             ok = False
     if ok:
         print(f"    All tiled layers fit bank ✓")
+
+
+def plan_db_tiles(layers, metadata):
+    """Pick a tile shape for each tiled layer and enable DB_EN where safe.
+
+    Two independent wins are available here:
+
+      1. Coverage waste. The shipped tiles are whole-bank blocks, so the grid
+         overshoots the tensor badly: L11 covers 14x14 with 8x13@2x2 (52.9%
+         of every tile is clipped away) and L5/L8 waste 48.4%. A shape that
+         divides the output evenly fetches and stores less real data.
+      2. Boundary overlap. DB_EN splits Act SRAM in half and lets the next
+         tile's input prefetch while the current one computes, but the tile
+         plus everything it reads must fit one half.
+
+    Both are searched together: for every (h, w) that fits a bank half we
+    score the total input words fetched across the whole layer, and take the
+    shape with the fewest boundaries among the cheapest ones.
+    """
+    half_w = (DEFAULT_HW.act_bank_size // 2) // 4
+    ofm_half_w = half_w * 2
+    retiled = []
+    for idx, l in enumerate(layers):
+        if l.tile_h == 0 or l.tile_w == 0:
+            continue
+        if l.op_type not in (0, 1, 2, 3, 4):
+            continue
+        eb = 2 if l.data_type == 1 else 1
+        m = metadata[idx]
+        if l.op_type == 3:
+            # Pool keeps its window in pool_cfg, not kernel/stride.
+            pc = m.get('pool_cfg', 0)
+            kh, kw = (pc >> 4) & 0xF, (pc >> 8) & 0xF
+            sh, sw = (pc >> 12) & 0xF, (pc >> 16) & 0xF
+        elif l.op_type == 4:
+            kh = kw = sh = sw = 1
+        else:
+            kh, kw = m['kernel_h'], m['kernel_w']
+            sh, sw = m['stride_h'], m['stride_w']
+        if kh == 0 or kw == 0 or sh == 0 or sw == 0:
+            continue
+        oh, ow = m['out_h'], m['out_w']
+        # Add parks both branch A and branch B in the same IFM half.
+        in_cap = (half_w // 2) if l.op_type == 4 else half_w
+
+        def cost(th, tw):
+            ih = (th - 1) * sh + kh
+            iw = (tw - 1) * sw + kw
+            in_w = (ih * iw * m['in_c'] * eb + 3) // 4
+            out_w = (th * tw * m['out_c'] * eb + 3) // 4
+            nh = (oh + th - 1) // th
+            nw = (ow + tw - 1) // tw
+            return in_w, out_w, nh, nw
+
+        def total_in(nh, nw, in_w):
+            return nh * nw * in_w
+
+        cur_in, cur_out, cur_nh, cur_nw = cost(l.tile_h, l.tile_w)
+        cur_total = total_in(cur_nh, cur_nw, cur_in)
+
+        # Layer 0's input is a pre-packed per-tile blob baked into the model
+        # data, so its grid cannot change without repacking the input tensor.
+        # Its existing 16x22 tile already fits both the IFM half (454 <= 3072)
+        # and the OFM half (5632 <= 6144), so enable DB_EN in place.
+        if idx == 0:
+            if cur_in <= in_cap and cur_out <= ofm_half_w:
+                l.sched_ctrl |= 0x01
+                metadata[idx]['sched_ctrl'] = l.sched_ctrl
+            continue
+
+        best = None
+        for th in range(1, oh + 1):
+            for tw in range(1, ow + 1):
+                in_w, out_w, nh, nw = cost(th, tw)
+                if in_w > in_cap or out_w > ofm_half_w:
+                    continue
+                ntile = nh * nw
+                if ntile < 2:        # nothing to overlap with one tile
+                    continue
+                # Every boundary costs a handshake plus the DMA latency that
+                # overlap does not hide, and measurements show that cost is
+                # per boundary rather than per byte. Rank by boundaries first
+                # so the search can never land on a degenerate 1x1 grid, then
+                # by fetched words.
+                key = (ntile, total_in(nh, nw, in_w))
+                if best is None or key < best[0]:
+                    best = (key, th, tw, nh, nw)
+
+        if best is None:
+            continue
+        (_, best_total), th, tw, nh, nw = best
+
+        if (th, tw) != (l.tile_h, l.tile_w):
+            l.tile_h, l.tile_w = th, tw
+            l.tile_num_h, l.tile_num_w = nh, nw
+            metadata[idx]['tile_h'] = th
+            metadata[idx]['tile_w'] = tw
+            metadata[idx]['tile_num_h'] = nh
+            metadata[idx]['tile_num_w'] = nw
+            retiled.append((idx, th, tw, cur_total, best_total))
+        l.sched_ctrl |= 0x01
+        metadata[idx]['sched_ctrl'] = l.sched_ctrl
+    return retiled
 
 
 if __name__ == '__main__':
