@@ -29,6 +29,55 @@ ONNX_PATH = '/tmp/npu_yolo_output_small__uoinc2r/model_single.onnx'
 WORK_DIR = '/tmp/model_c_int8_golden'
 GOLDEN_OUT = '/data/sam/open-npu/rtl/tb/golden/golden_dma_e2e/model_c_int8'
 
+
+def pack_conv_pool_fuse_strips(input_nhwc, conv, pool):
+    """Pack L0 input as full-width strips for SRAM-resident Conv→Pool."""
+    elem_bytes = input_nhwc.dtype.itemsize
+    pool_h = pool.pool_h
+    pool_sh = pool.pool_stride_h
+
+    # The producer lives in the 48KB OFM bank; after the role swap the Pool
+    # output must fit the 24KB IFM bank. Pick the tallest legal strip.
+    pool_strip_h = 0
+    for candidate in range(1, pool.out_h + 1):
+        producer_h = (candidate - 1) * pool_sh + pool_h
+        producer_bytes = producer_h * conv.out_w * conv.out_c * elem_bytes
+        pool_out_bytes = candidate * pool.out_w * pool.out_c * elem_bytes
+        conv_in_h = (producer_h - 1) * conv.stride_h + conv.kernel_h
+        conv_in_w = (conv.out_w - 1) * conv.stride_w + conv.kernel_w
+        conv_in_bytes = conv_in_h * conv_in_w * conv.in_c * elem_bytes
+        if (producer_bytes > 48 * 1024 or pool_out_bytes > 24 * 1024
+                or conv_in_bytes > 24 * 1024):
+            break
+        pool_strip_h = candidate
+    if pool_strip_h == 0:
+        raise RuntimeError("L0→L1 has no legal Conv→Pool fusion strip")
+
+    producer_h = (pool_strip_h - 1) * pool_sh + pool_h
+    input_h = (producer_h - 1) * conv.stride_h + conv.kernel_h
+    input_w = (conv.out_w - 1) * conv.stride_w + conv.kernel_w
+    strip_count = (pool.out_h + pool_strip_h - 1) // pool_strip_h
+    strip_input_step = pool_strip_h * pool_sh * conv.stride_h
+    pad_value = -conv.in_zp
+
+    padded_h = max((strip_count - 1) * strip_input_step + input_h,
+                   conv.pad_top + conv.in_h)
+    padded_w = max(input_w, conv.pad_left + conv.in_w)
+    padded = np.full((padded_h, padded_w, conv.in_c), pad_value,
+                     dtype=input_nhwc.dtype)
+    padded[conv.pad_top:conv.pad_top + conv.in_h,
+           conv.pad_left:conv.pad_left + conv.in_w, :] = input_nhwc
+
+    strips = []
+    for strip in range(strip_count):
+        row = strip * strip_input_step
+        flat = padded[row:row + input_h, :input_w, :].reshape(-1)
+        packed = np.zeros((flat.nbytes + 3) // 4 * 4, dtype=np.uint8)
+        packed[:flat.nbytes] = flat.view(np.uint8)
+        strips.append(packed.view('<u4'))
+    return np.concatenate(strips)
+
+
 def create_unfused(src, dst):
     """Create unfused version (clear FUSE bits in sched_ctrl) + enlarge tiles."""
     shutil.copy2(src, dst)
@@ -207,6 +256,9 @@ def main():
     # Step 5: Generate golden data
     print("Step 5: Generate golden data")
     generate_golden(layers, weight_blob, input_nhwc, GOLDEN_OUT)
+    fuse_input = pack_conv_pool_fuse_strips(input_nhwc, layers[0], layers[1])
+    np.save(os.path.join(GOLDEN_OUT, 'layer_00_fuse_input.npy'), fuse_input)
+    print(f"  L0→L1 fuse input: {len(fuse_input)} words")
 
     # Step 5b: Patch per-tile store for DB_EN + tiled layers,
     # and add tiling for non-tiled layers that overflow SRAM
