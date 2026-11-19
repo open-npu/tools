@@ -151,12 +151,13 @@ def main():
         meta['ddr_out_addr'] = meta['ddr_out_addr'] + in_b_size_align
         print(f"  L{idx:2d} Add: add_b_addr=0x{meta['ddr_add_b_addr']:08X}")
 
-    # Step 5c: Patch per-tile store for DB_EN + tiled layers
+    # Step 5c: Patch per-tile store for every tiled layer.  Single-buffer
+    # tiling still needs PTS; otherwise each tile overwrites the same DDR
+    # region and chained inference sees only the final tile.
     for i, m in enumerate(md):
-        db_en = m['sched_ctrl'] & 1
         has_tile = m.get('tile_h', 0) > 0 and m.get('tile_w', 0) > 0
-        if db_en and has_tile:
-            m['sched_ctrl'] = m['sched_ctrl'] | 0x10  # Set PTS bit
+        if has_tile:
+            m['sched_ctrl'] = (m['sched_ctrl'] & ~0x0F) | 0x10
             m['store_mode'] = 1  # PER_TILE_STORE_EN
             eb = 2 if m.get('post_ctrl', 0) & 0x80 else 1  # INT16_OUT
             tile_h = m['tile_h']

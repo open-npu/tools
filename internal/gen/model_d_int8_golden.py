@@ -79,6 +79,10 @@ def main():
             num_calib=20,
             bits=8,
             ptq_method='mse',
+            # CSIM's converter-stamped super-layer path does not dump reliable
+            # intermediates for D8 L16-L18. Generate independent references;
+            # firmware still enables and verifies the RTL SRAM fusion chain.
+            no_fuse=True,
         )
     else:
         print(f"  Reusing model by request: {model_bin}")

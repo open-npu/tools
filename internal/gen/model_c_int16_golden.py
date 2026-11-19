@@ -124,7 +124,7 @@ def main():
     print("Step 5: Generate golden data")
     generate_golden(layers, weight_blob, input_nhwc, GOLDEN_OUT)
 
-    # Step 5b: Patch per-tile store for DB_EN + tiled layers,
+    # Step 5b: Patch per-tile store for every tiled layer,
     # and add tiling for non-tiled layers that overflow SRAM
     import json
     ACT_DEPTH = 12288  # SPAD_KB * 64
@@ -158,10 +158,11 @@ def main():
             m['tile_in_size'] = tile_in_words * 4
             print(f"  L{i}: auto-tiled {tile_h}x{out_w}@{tile_num_h}x{tile_num_w} (input was {m['n_input_words']} > {ACT_DEPTH})")
 
-        db_en = m['sched_ctrl'] & 1
         has_tile = m.get('tile_h', 0) > 0 and m.get('tile_w', 0) > 0
-        if db_en and has_tile:
-            m['sched_ctrl'] = m['sched_ctrl'] | 0x10  # Set PTS bit
+        if has_tile:
+            # Single-buffer tiling still needs PTS.  Clear the legacy DB
+            # submode bits and retain only the current per-tile-store contract.
+            m['sched_ctrl'] = (m['sched_ctrl'] & ~0x0F) | 0x10
             m['store_mode'] = 1
             tile_h = m['tile_h']
             tile_w = m['tile_w']

@@ -110,6 +110,16 @@ class Phase1GuardTests(unittest.TestCase):
         self.assertGreater(result["tile_num_h"] * result["tile_num_w"], 1)
         self.assertTrue(result["per_tile_store_en"])
 
+    def test_int16_pool_avoids_partial_tail_tiles(self):
+        result = compute_tiling(
+            "pool", 26, 26, 128, 13, 13, 128,
+            kernel_h=2, kernel_w=2, stride_h=2, stride_w=2,
+            elem_size=2,
+        )
+        self.assertEqual(13 % result["tile_h"], 0)
+        self.assertEqual(13 % result["tile_w"], 0)
+        self.assertTrue(result["per_tile_store_en"])
+
     def test_global_depthwise_uses_streaming_exception(self):
         result = compute_tiling(
             "dw", 14, 14, 512, 1, 1, 512,
