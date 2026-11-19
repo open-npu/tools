@@ -149,8 +149,18 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     else:
         tile_w_candidates = range(1, max_tile_w + 1)
 
+    # INT16 pool PTS does not support a partial final tile: its vectorized
+    # writeback emits complete 32-bit element pairs and can overwrite the next
+    # NHWC row at a right/bottom tail.  Keep INT8's established search
+    # unchanged, but choose exact divisors for INT16 pooling.
+    exact_pool_tiles = op_type == 'pool' and elem_size == 2
+
     for tile_h in range(1, max_tile_h + 1):
+        if exact_pool_tiles and out_h % tile_h:
+            continue
         for tile_w in tile_w_candidates:
+            if exact_pool_tiles and out_w % tile_w:
+                continue
             # Output tile constraint: tile_h * tile_w * tile_oc * elem_size <= act_bank
             out_tile_size = tile_h * tile_w * tile_oc * elem_size
             if out_tile_size > act_bank:
