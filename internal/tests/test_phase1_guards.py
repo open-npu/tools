@@ -18,6 +18,7 @@ from model_packer import (
     ref_pooling,
 )
 from tiling import compute_tiling
+from super_tile import SuperLayer, model_a_tile_for, plan_super_tile
 from extract_npu1_layers import LayerConfig as ExtractedLayerConfig
 from bin2golden import use_group_major, wgt_per_oc_words
 from perf_model import (
@@ -210,6 +211,56 @@ class Phase1GuardTests(unittest.TestCase):
             sum(result["layer_cycles"] for result in optimized),
             sum(result["layer_cycles"] for result in baseline),
         )
+
+    def test_model_a_l52_l54_super_tile_capacity(self):
+        layers = [
+            SuperLayer("conv", 14, 14, 96, 14, 14, 192),
+            SuperLayer("dw", 14, 14, 192, 14, 14, 192,
+                       kernel_h=3, kernel_w=3),
+            SuperLayer("conv", 14, 14, 192, 14, 14, 96),
+        ]
+        plan = plan_super_tile(layers, tile_h=14, tile_w=12)
+        self.assertEqual((plan.tile_rows, plan.tile_cols), (1, 2))
+        self.assertEqual(plan.weight_bytes, 38592)
+        self.assertEqual(plan.param_bytes, 7680)
+        self.assertLessEqual(plan.ifm_peak_bytes, 32 * 1024)
+        self.assertLessEqual(plan.ofm_peak_bytes, 48 * 1024)
+
+    def test_all_model_a_strict_super_geometries_fit(self):
+        for spatial, in_c, mid_c, expected_grid in (
+                (56, 56, 112, (2, 6)),
+                (28, 96, 192, (1, 5)),
+                (14, 96, 192, (1, 2))):
+            th, tw = model_a_tile_for(spatial)
+            layers = [
+                SuperLayer("conv", spatial, spatial, in_c,
+                           spatial, spatial, mid_c),
+                SuperLayer("dw", spatial, spatial, mid_c,
+                           spatial, spatial, mid_c, kernel_h=3, kernel_w=3),
+                SuperLayer("conv", spatial, spatial, mid_c,
+                           spatial, spatial, in_c),
+            ]
+            plan = plan_super_tile(layers, tile_h=th, tile_w=tw)
+            self.assertEqual((plan.tile_rows, plan.tile_cols), expected_grid)
+
+    def test_super_tile_rejects_db_and_capacity_overflow(self):
+        db_layers = [
+            SuperLayer("conv", 14, 14, 96, 14, 14, 192, db_en=True),
+            SuperLayer("dw", 14, 14, 192, 14, 14, 192,
+                       kernel_h=3, kernel_w=3),
+            SuperLayer("conv", 14, 14, 192, 14, 14, 96),
+        ]
+        with self.assertRaisesRegex(ValueError, "single-buffer"):
+            plan_super_tile(db_layers)
+
+        too_wide = [
+            SuperLayer("conv", 14, 14, 1024, 14, 14, 1024),
+            SuperLayer("dw", 14, 14, 1024, 14, 14, 1024,
+                       kernel_h=3, kernel_w=3),
+            SuperLayer("conv", 14, 14, 1024, 14, 14, 1024),
+        ]
+        with self.assertRaisesRegex(ValueError, "capacity exceeded"):
+            plan_super_tile(too_wide)
 
 
 if __name__ == "__main__":
