@@ -15,8 +15,10 @@ from dataclasses import dataclass
 class HWConfig:
     """NPU hardware configuration (all dimensions freely configurable)."""
     mac_lanes: int = 64          # Dense row MACs issued per cycle
-    act_bank_size: int = 24576   # IFM bytes (24KB). DB half is 12KB. OFM is 48KB.
+    act_bank_size: int = 32768   # IFM bytes (32KB). DB half is 16KB.
+    ofm_bank_size: int = 49152   # OFM bytes (48KB). DB half is 24KB.
     weight_buf_size: int = 81920 # Weight SRAM bytes (80KB)
+    param_sram_size: int = 12288 # Parameter SRAM bytes (12KB)
     param_sram_max_ch: int = 512 # Max output channels per param tile (= param_sram / 14)
     dw_parallel_ch: int = 8      # Depthwise channels processed in parallel
     has_int16: bool = True       # INT16 data type support
@@ -29,9 +31,8 @@ class HWConfig:
 
     @property
     def spad_total_kb(self) -> int:
-        # IFM is act_bank_size. OFM is a separate 48KB bank; param is 12KB.
-        return (self.act_bank_size + 48 * 1024
-                + self.weight_buf_size + 12 * 1024) // 1024
+        return (self.act_bank_size + self.ofm_bank_size
+                + self.weight_buf_size + self.param_sram_size) // 1024
 
 
 # Default config: one 64-MAC dense row plus an 8-lane depthwise bank.
@@ -46,7 +47,9 @@ def hw_config_from_args(args) -> HWConfig:
         --param-max-ch, --no-int16, --ext-bw
     """
     act_bank_kb = getattr(args, 'act_bank_kb', None)
+    ofm_bank_kb = getattr(args, 'ofm_bank_kb', None)
     weight_buf_kb = getattr(args, 'weight_buf_kb', None)
+    param_kb = getattr(args, 'param_kb', None)
 
     legacy_array = getattr(args, 'array_size', None)
     return HWConfig(
@@ -54,8 +57,12 @@ def hw_config_from_args(args) -> HWConfig:
                    or (legacy_array * legacy_array if legacy_array else None)
                    or DEFAULT_HW.mac_lanes),
         act_bank_size=(act_bank_kb * 1024) if act_bank_kb else DEFAULT_HW.act_bank_size,
+        ofm_bank_size=(ofm_bank_kb * 1024) if ofm_bank_kb else DEFAULT_HW.ofm_bank_size,
         weight_buf_size=(weight_buf_kb * 1024) if weight_buf_kb else DEFAULT_HW.weight_buf_size,
-        param_sram_max_ch=getattr(args, 'param_max_ch', None) or DEFAULT_HW.param_sram_max_ch,
+        param_sram_size=(param_kb * 1024) if param_kb else DEFAULT_HW.param_sram_size,
+        param_sram_max_ch=(getattr(args, 'param_max_ch', None)
+                           or ((param_kb * 1024) // 16 if param_kb
+                               else DEFAULT_HW.param_sram_max_ch)),
         dw_parallel_ch=(getattr(args, 'dw_lanes', None)
                         or legacy_array or DEFAULT_HW.dw_parallel_ch),
         has_int16=not getattr(args, 'no_int16', False),
@@ -75,11 +82,15 @@ def add_hw_args(parser):
     grp.add_argument('--array-size', type=int, default=None,
                      help='Deprecated compatibility alias: maps N to N*N MAC lanes and N DW lanes')
     grp.add_argument('--act-bank-kb', type=int, default=None,
-                     help='IFM bank size in KB (default: 24)')
+                     help='IFM bank size in KB (default: 32)')
+    grp.add_argument('--ofm-bank-kb', type=int, default=None,
+                     help='OFM bank size in KB (default: 48)')
     grp.add_argument('--weight-buf-kb', type=int, default=None,
                      help='Weight buffer size in KB (default: 80)')
     grp.add_argument('--param-max-ch', type=int, default=None,
                      help='Max output channels per param tile (default: 512)')
+    grp.add_argument('--param-kb', type=int, default=None,
+                     help='Parameter SRAM size in KB (default: 12)')
     grp.add_argument('--no-int16', action='store_true',
                      help='Disable INT16 support (INT8 only)')
     grp.add_argument('--ext-bw', type=int, default=None,

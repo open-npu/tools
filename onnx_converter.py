@@ -128,6 +128,14 @@ def parse_onnx_graph(model_path):
     weights = {}
     for init in model.graph.initializer:
         weights[init.name] = numpy_helper.to_array(init)
+    # Clip bounds and reshape parameters may be emitted as Constant nodes
+    # rather than initializers. Resolve them before operator fusion.
+    for node in model.graph.node:
+        if node.op_type != 'Constant' or not node.output:
+            continue
+        for attr in node.attribute:
+            if attr.name == 'value':
+                weights[node.output[0]] = numpy_helper.to_array(attr.t)
 
     # Build shape map
     shape_map = {}
@@ -880,8 +888,22 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     # Map: tensor_name → quantization params (scale, zp)
     tensor_quant = {}
-    # Map: tensor_name → fused layer index (for residual tracking)
-    tensor_to_layer_idx = {}
+    # Several identical Relu nodes may consume one tensor. Fusion keeps one,
+    # so every duplicate output must still resolve to that fused layer.
+    relu_aliases = {}
+    for node in nodes:
+        if node.op_type == 'Relu' and node.inputs and node.outputs:
+            relu_aliases.setdefault(node.inputs[0], []).append(node.outputs[0])
+
+    class LayerIndex(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            for source in {key, resolve_passthrough(key)}:
+                for alias in relu_aliases.get(source, []):
+                    if alias not in self:
+                        super().__setitem__(alias, value)
+
+    tensor_to_layer_idx = LayerIndex()
 
     def compute_input_src(input_tensor_name):
         """Determine input_src for a layer given its primary input tensor name.

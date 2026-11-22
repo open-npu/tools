@@ -43,7 +43,11 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     # DB_EN ping-pongs the activation SRAM only. The RTL has one full-capacity
     # weight SRAM and reloads each OC group at address 0; treating it as two
     # 40KB banks creates artificial OC groups that hardware does not require.
-    act_bank = profile.act_bank_size // 2 if double_buffer else profile.act_bank_size
+    ifm_bank = profile.act_bank_size // 2 if double_buffer else profile.act_bank_size
+    ofm_bank = profile.ofm_bank_size // 2 if double_buffer else profile.ofm_bank_size
+    # Concat has an in-place cumulative output contract; keep its conservative
+    # single-bank accounting below.
+    act_bank = min(ifm_bank, ofm_bank)
     weight_buf = profile.weight_buf_size
     param_max_ch = profile.param_sram_max_ch
 
@@ -112,11 +116,9 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     full_output_size = out_h * out_w * out_c * elem_size
     full_weight_size = kernel_h * kernel_w * in_c * out_c * elem_size if op_type == 'conv' else 0
 
-    # In DB_EN mode, input (at SRAM offset 0) and output (at offset tile_in_words)
-    # coexist in the same bank, so their sum must fit. In non-DB mode, the input
-    # is overwritten by output during compute, so they need only fit individually.
-    coexist_ok = (full_input_size + full_output_size <= act_bank) if double_buffer \
-                 else (full_input_size <= act_bank and full_output_size <= act_bank)
+    # IFM and OFM are separate physical SRAMs. DB_EN halves each independently.
+    coexist_ok = (full_input_size <= ifm_bank
+                  and full_output_size <= ofm_bank)
     if (coexist_ok and
         full_weight_size <= weight_buf):
         # No tiling needed — small layer fits entirely in SRAM
@@ -134,8 +136,8 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
 
     # Search: try all reasonable tile sizes, pick largest area with smallest perimeter
     # Limit search space for efficiency
-    max_tile_h = min(out_h, act_bank // (tile_oc * elem_size))
-    max_tile_w = min(out_w, act_bank // (tile_oc * elem_size))
+    max_tile_h = min(out_h, ofm_bank // (tile_oc * elem_size))
+    max_tile_w = min(out_w, ofm_bank // (tile_oc * elem_size))
 
     # PTS 2D store places each tile at DDR byte offset (tx*tile_w*out_c*elem_size);
     # the DMA writes whole words, so that offset must stay a multiple of 4. When
@@ -163,7 +165,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
                 continue
             # Output tile constraint: tile_h * tile_w * tile_oc * elem_size <= act_bank
             out_tile_size = tile_h * tile_w * tile_oc * elem_size
-            if out_tile_size > act_bank:
+            if out_tile_size > ofm_bank:
                 break  # tile_w only grows, so break inner loop
 
             # Input tile dimensions (including halo for convolution)
@@ -172,12 +174,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
 
             # Input tile constraint: in_tile_h * in_tile_w * in_c * elem_size <= act_bank
             in_tile_size = in_tile_h * in_tile_w * in_c * elem_size
-            if in_tile_size > act_bank:
-                break  # tile_w only grows, so break inner loop
-
-            # DB_EN: input (offset 0) and output (offset tile_in_words) coexist
-            # in the same bank — their sum must fit.
-            if double_buffer and (in_tile_size + out_tile_size) > act_bank:
+            if in_tile_size > ifm_bank:
                 break  # tile_w only grows, so break inner loop
 
             # This tile is valid. Prefer larger area; tie-break by squareness.
@@ -200,23 +197,13 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     tile_h = best_tile_h
     tile_w = best_tile_w
 
-    # ─── Safety clamp: real DB_EN bank must hold input + FULL output ───
-    # The RTL output buffer accumulates ALL out_c channels before the per-tile
-    # store (writeback indexes by the active row output group; store fires on tile_done
-    # after the last oc_group). The tile_oc budget above only constrains the
-    # WEIGHT buffer and can under-size the output buffer for per-OC-reload
-    # layers (out_c > tile_oc), overflowing the single DB_EN bank and dropping
-    # the tile's bottom rows out of SRAM bounds (e.g. model_x int16 L13 out_c=512:
-    # 4x6 tile → in+out 7680w > 6144w bank → tile(0,1) bottom row written to
-    # SRAM addr 12288+ = out of bounds). Enforce the real constraint: input tile
-    # (with halo) + full output tile (out_c) must fit one bank (act_bank_size).
-    # Only shrinks tiles that would actually overflow; fitting tiles unchanged.
+    # The output SRAM accumulates all out_c channels, not only tile_oc.
     while tile_h > 1 or tile_w > 1:
         in_tile_h = tile_h * stride_h + kh_eff - stride_h
         in_tile_w = tile_w * stride_w + kw_eff - stride_w
         real_in  = in_tile_h * in_tile_w * in_c * elem_size
         real_out = tile_h * tile_w * out_c * elem_size
-        if real_in + real_out <= profile.act_bank_size:
+        if real_in <= ifm_bank and real_out <= ofm_bank:
             break
         if tile_h >= tile_w and tile_h > 1:
             tile_h -= 1
@@ -229,11 +216,10 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     in_tile_w = tile_w * stride_w + kw_eff - stride_w
     real_in = in_tile_h * in_tile_w * in_c * elem_size
     real_out = tile_h * tile_w * out_c * elem_size
-    if real_in > profile.act_bank_size or real_out > profile.act_bank_size or (
-            double_buffer and real_in + real_out > profile.act_bank_size):
+    if real_in > ifm_bank or real_out > ofm_bank:
         raise ValueError(
             f"No feasible SRAM-safe tile for {op_type}: 1x1 requires "
-            f"input={real_in}B output={real_out}B, bank={profile.act_bank_size}B"
+            f"input={real_in}B/{ifm_bank}B output={real_out}B/{ofm_bank}B"
         )
 
     # Compute tile counts
