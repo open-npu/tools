@@ -303,8 +303,11 @@ def stamp_fused_tiling(layers, block: FusedBlock, tiling: FusedTiling,
         add_oc = add.out_c if hasattr(add, 'out_c') else add.get('out_c')
         if add_op in ('add', 4) and add_oh == block.out_h and add_ow == block.out_w \
                 and add_oc == block.c_out:
+            # The project layer becomes another middle stage so it skips its
+            # DDR store; Add is the block end and stores the final result.
+            fuse_bits[-1] = _FUSE_MID
             idxs.append(add_idx)
-            fuse_bits.append(0)
+            fuse_bits.append(_FUSE_END)
 
     # One spatial tile → present as untiled so RTL skip_act_load (tile_h==0) works.
     if tiling.spatial_tiles <= 1:
@@ -634,7 +637,8 @@ if __name__ == '__main__':
     assert all((s['sched_ctrl'] & _DB_EN) == 0 for s in stamped), "DB_EN must be off"
     assert stamped[0]['sched_ctrl'] & _FUSE_START
     assert stamped[1]['sched_ctrl'] & _FUSE_MID
-    assert stamped[2]['sched_ctrl'] & _FUSE_END
+    assert stamped[2]['sched_ctrl'] & _FUSE_MID
+    assert stamped[3]['sched_ctrl'] & _FUSE_END
     print(f"  Shared grid: {grids[0][0]}×{grids[0][1]}  {grids[0][2]}×{grids[0][3]} tiles")
     print("  PASS: START/MID/END/Add share one grid, DB_EN cleared")
 
