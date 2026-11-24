@@ -54,6 +54,9 @@ SCHED_CTRL_FUSE_START     = (1 << 1)   # bit[1]: first layer of fused block
 SCHED_CTRL_FUSE_MID       = (1 << 2)   # bit[2]: middle layer of fused block
 SCHED_CTRL_FUSE_END       = (1 << 3)   # bit[3]: last layer of fused block
 SCHED_CTRL_PER_TILE_STORE = (1 << 4)   # bit[4]: per-tile store to NHWC DDR (cascaded inference)
+SCHED_CTRL_FUSE_STRIP     = (1 << 5)   # bit[5]: firmware Conv->Pool NHWC strip fusion
+SCHED_CTRL_NO_AUTO_DB     = (1 << 6)   # bit[6]: firmware-only disable auto DB
+SCHED_CTRL_SUPER_BLOCK    = (1 << 7)   # bit[7]: RTL/firmware Conv1x1->DW3x3->Conv1x1 super-block
 
 # ─── Weight blob layouts (LayerConfig.wgt_layout) ───
 #

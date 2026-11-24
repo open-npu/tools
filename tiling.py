@@ -112,7 +112,8 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
         tile_oc = out_c
 
     # Check if the entire layer fits without tiling
-    full_input_size = in_h * in_w * in_c * elem_size
+    in_mult = 2 if op_type == 'add' else 1
+    full_input_size = in_mult * in_h * in_w * in_c * elem_size
     full_output_size = out_h * out_w * out_c * elem_size
     full_weight_size = kernel_h * kernel_w * in_c * out_c * elem_size if op_type == 'conv' else 0
 
@@ -173,7 +174,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
             in_tile_w = tile_w * stride_w + kw_eff - stride_w
 
             # Input tile constraint: in_tile_h * in_tile_w * in_c * elem_size <= act_bank
-            in_tile_size = in_tile_h * in_tile_w * in_c * elem_size
+            in_tile_size = in_mult * in_tile_h * in_tile_w * in_c * elem_size
             if in_tile_size > ifm_bank:
                 break  # tile_w only grows, so break inner loop
 
@@ -201,7 +202,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     while tile_h > 1 or tile_w > 1:
         in_tile_h = tile_h * stride_h + kh_eff - stride_h
         in_tile_w = tile_w * stride_w + kw_eff - stride_w
-        real_in  = in_tile_h * in_tile_w * in_c * elem_size
+        real_in  = in_mult * in_tile_h * in_tile_w * in_c * elem_size
         real_out = tile_h * tile_w * out_c * elem_size
         if real_in <= ifm_bank and real_out <= ofm_bank:
             break
@@ -214,7 +215,7 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
 
     in_tile_h = tile_h * stride_h + kh_eff - stride_h
     in_tile_w = tile_w * stride_w + kw_eff - stride_w
-    real_in = in_tile_h * in_tile_w * in_c * elem_size
+    real_in = in_mult * in_tile_h * in_tile_w * in_c * elem_size
     real_out = tile_h * tile_w * out_c * elem_size
     if real_in > ifm_bank or real_out > ofm_bank:
         raise ValueError(

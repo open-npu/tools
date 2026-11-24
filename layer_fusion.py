@@ -272,6 +272,8 @@ _FUSE_MID = 1 << 2
 _FUSE_END = 1 << 3
 _DB_EN = 1 << 0
 _PTS = 1 << 4
+_FUSE_STRIP = 1 << 5
+_SUPER_BLOCK = 1 << 7
 
 
 def stamp_fused_tiling(layers, block: FusedBlock, tiling: FusedTiling,
@@ -344,6 +346,426 @@ def stamp_fused_tiling(layers, block: FusedBlock, tiling: FusedTiling,
         _set(lyr, 'tile_num_w', nw)
 
     return len(idxs)
+
+
+def _lf_get(obj, key, default=None):
+    if hasattr(obj, key):
+        return getattr(obj, key)
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+
+def _lf_set(obj, key, val):
+    if hasattr(obj, key):
+        setattr(obj, key, val)
+    else:
+        obj[key] = val
+
+
+def _collect_referenced(layers, must_store_indices=None) -> set:
+    ref = set(must_store_indices or ())
+    for lyr in layers:
+        for key in ('input_src', 'residual_src'):
+            v = _lf_get(lyr, key, -1)
+            if v is not None and int(v) >= 0:
+                ref.add(int(v))
+    return ref
+
+
+def apply_super_block_fusion(layers, profile: HWConfig = None,
+                             must_store_indices=None) -> List[tuple]:
+    """Detect and mark general INT8 stride-1 Conv1x1 -> DW3x3 -> Conv1x1 super-blocks.
+
+    Works identically on LayerConfig instances (in onnx_converter) and metadata
+    dicts (in gen_soc_test). Skips blocks that already fit completely untiled in
+    SRAM (since untiled FUSE_START/MID/END executes with zero halo overhead).
+    """
+    if profile is None:
+        profile = DEFAULT_HW
+    ifm_bytes = profile.act_bank_size
+    ofm_bytes = profile.ofm_bank_size
+    wgt_words_cap = profile.weight_buf_size // 4
+    param_words_cap = profile.param_sram_size // 4
+    untiled_cap = min(ifm_bytes, ofm_bytes)
+
+    referenced = _collect_referenced(layers, must_store_indices)
+    marked = []
+    n = len(layers)
+    i = 1  # i >= 1 guarantees NHWC input from a preceding NPU layer in DDR
+    while i + 2 < n:
+        a, b, c = layers[i], layers[i + 1], layers[i + 2]
+        if i in referenced or (i + 1) in referenced:
+            i += 1
+            continue
+        b_src = int(_lf_get(b, 'input_src', -1))
+        c_src = int(_lf_get(c, 'input_src', -1))
+        if b_src not in (-1, i) or c_src not in (-1, i + 1):
+            i += 1
+            continue
+
+        # Must be INT8 Conv1x1(s1,p0) -> DW3x3(s1,p1) -> Conv1x1(s1,p0)
+        if (_lf_get(a, 'op_type') != 0 or _lf_get(b, 'op_type') != 1 or _lf_get(c, 'op_type') != 0):
+            i += 1
+            continue
+        if any(int(_lf_get(x, 'data_type', 0)) != 0 for x in (a, b, c)):
+            i += 1
+            continue
+        if any(int(_lf_get(x, 'dilation_h', 1)) != 1 or int(_lf_get(x, 'dilation_w', 1)) != 1
+               for x in (a, b, c)):
+            i += 1
+            continue
+        if any(int(_lf_get(x, 'wgt_layout', 1)) != 1 for x in (a, b, c)):
+            i += 1
+            continue
+
+        h = int(_lf_get(a, 'in_h', 0))
+        w = int(_lf_get(a, 'in_w', 0))
+        in_c = int(_lf_get(a, 'in_c', 0))
+        mid_c = int(_lf_get(a, 'out_c', 0))
+        out_c = int(_lf_get(c, 'out_c', 0))
+
+        b_pad_ok = (int(_lf_get(b, 'pad_top', 0)) == 1
+                    and int(_lf_get(b, 'pad_left', 0)) == 1
+                    and int(_lf_get(b, 'pad_bottom', 1)) == 1
+                    and int(_lf_get(b, 'pad_right', 1)) == 1)
+        a_pad_ok = (int(_lf_get(a, 'pad_top', 0)) == 0
+                    and int(_lf_get(a, 'pad_left', 0)) == 0
+                    and int(_lf_get(a, 'pad_bottom', 0)) == 0
+                    and int(_lf_get(a, 'pad_right', 0)) == 0)
+        c_pad_ok = (int(_lf_get(c, 'pad_top', 0)) == 0
+                    and int(_lf_get(c, 'pad_left', 0)) == 0
+                    and int(_lf_get(c, 'pad_bottom', 0)) == 0
+                    and int(_lf_get(c, 'pad_right', 0)) == 0)
+
+        geom_ok = (
+            h > 0 and w > 0
+            and in_c >= 4 and (in_c % 4) == 0
+            and mid_c >= 4 and (mid_c % 4) == 0
+            and out_c >= 4 and (out_c % 4) == 0
+            and (_lf_get(a, 'out_h'), _lf_get(a, 'out_w')) == (h, w)
+            and (_lf_get(b, 'in_h'), _lf_get(b, 'in_w'), _lf_get(b, 'out_h'), _lf_get(b, 'out_w')) == (h, w, h, w)
+            and (_lf_get(c, 'in_h'), _lf_get(c, 'in_w'), _lf_get(c, 'out_h'), _lf_get(c, 'out_w')) == (h, w, h, w)
+            and int(_lf_get(b, 'in_c')) == mid_c and int(_lf_get(b, 'out_c')) == mid_c
+            and int(_lf_get(c, 'in_c')) == mid_c
+            and (_lf_get(a, 'kernel_h'), _lf_get(a, 'kernel_w'), _lf_get(a, 'stride_h'), _lf_get(a, 'stride_w')) == (1, 1, 1, 1)
+            and (_lf_get(b, 'kernel_h'), _lf_get(b, 'kernel_w'), _lf_get(b, 'stride_h'), _lf_get(b, 'stride_w')) == (3, 3, 1, 1)
+            and (_lf_get(c, 'kernel_h'), _lf_get(c, 'kernel_w'), _lf_get(c, 'stride_h'), _lf_get(c, 'stride_w')) == (1, 1, 1, 1)
+            and a_pad_ok and b_pad_ok and c_pad_ok
+        )
+        if not geom_ok:
+            i += 1
+            continue
+
+        # Skip blocks that fit completely untiled in SRAM (handled with zero halo
+        # by apply_untiled_sram_fusion).
+        all_untiled = (
+            int(_lf_get(a, 'tile_h', 0)) == 0
+            and int(_lf_get(b, 'tile_h', 0)) == 0
+            and int(_lf_get(c, 'tile_h', 0)) == 0
+            and max(h * w * in_c, h * w * mid_c, h * w * out_c) <= untiled_cap
+        )
+        if all_untiled:
+            i += 1
+            continue
+
+        # Resident weight + param SRAM capacity across all 3 slots
+        wgt_words = ((in_c * mid_c + 3) // 4
+                     + (9 * mid_c + 3) // 4
+                     + (mid_c * out_c + 3) // 4)
+        param_words = (mid_c + mid_c + out_c) * 4
+        if wgt_words > wgt_words_cap or param_words > param_words_cap:
+            i += 1
+            continue
+
+        # Search optimal (th, tw) satisfying S_SUPER_VALIDATE IFM/OFM caps
+        best_cost = None
+        best_hw = None
+        for th in range(1, h + 1):
+            tiles_h = (h + th - 1) // th
+            if (tiles_h - 1) * th >= h:
+                continue
+            for tw in range(1, w + 1):
+                tiles_w = (w + tw - 1) // tw
+                if (tiles_w - 1) * tw >= w:
+                    continue
+                ifm_peak = max((th + 2) * (tw + 2) * in_c, th * tw * mid_c)
+                ofm_peak = max((th + 2) * (tw + 2) * mid_c, th * tw * out_c)
+                if ifm_peak > ifm_bytes or ofm_peak > ofm_bytes:
+                    break  # both peaks grow monotonically with tw
+                ntiles = tiles_h * tiles_w
+                if ntiles <= 1:
+                    # Whole map fits super-block SRAM in 1 tile, or search keeps going
+                    pass
+                halo_pixels = ntiles * (th + 2) * (tw + 2)
+                dma_rows = ntiles * (th + 2)
+                cost = (ntiles, halo_pixels, dma_rows, abs(th - tw))
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_hw = (th, tw, tiles_h, tiles_w)
+
+        if best_hw is None:
+            i += 1
+            continue
+
+        th, tw, nh, nw = best_hw
+        for idx_sub, x in enumerate((a, b, c)):
+            _lf_set(x, 'tile_h', th)
+            _lf_set(x, 'tile_w', tw)
+            _lf_set(x, 'tile_num_h', nh)
+            _lf_set(x, 'tile_num_w', nw)
+            sched = int(_lf_get(x, 'sched_ctrl', 0)) & ~0xFF
+            sched |= _PTS
+            if idx_sub == 0:
+                sched |= _SUPER_BLOCK
+            _lf_set(x, 'sched_ctrl', sched)
+            if isinstance(x, dict):
+                x['store_mode'] = 1
+                in_th = (th - 1) * int(x['stride_h']) + int(x['kernel_h'])
+                in_tw = (tw - 1) * int(x['stride_w']) + int(x['kernel_w'])
+                x['tile_in_size'] = ((in_th * in_tw * int(x['in_c']) + 3) // 4) * 4
+                x['tile_out_size'] = ((th * tw * int(x['out_c']) + 3) // 4) * 4
+                x['row_cfg'] = (th << 16) | ((tw * int(x['out_c']) + 3) // 4)
+        marked.append((i, th, tw, nh, nw))
+        i += 3
+
+    return marked
+
+
+def compute_conv_pool_strip_params(conv, pool, profile: HWConfig = None):
+    """Return (pool_strip_h, producer_h, strip_count) if Conv->Pool strip fusion
+    is legal and bandwidth-profitable, else None.
+    """
+    if profile is None:
+        profile = DEFAULT_HW
+    ifm_bytes = profile.act_bank_size
+    ofm_bytes = profile.ofm_bank_size
+    wgt_bytes_cap = profile.weight_buf_size
+    param_max_ch = profile.param_sram_max_ch
+    untiled_cap = min(ifm_bytes, ofm_bytes)
+
+    if int(_lf_get(conv, 'op_type', -1)) != 0 or int(_lf_get(pool, 'op_type', -1)) != 3:
+        return None
+    if int(_lf_get(conv, 'data_type', 0)) != 0 or int(_lf_get(pool, 'data_type', 0)) != 0:
+        return None
+    if int(_lf_get(conv, 'wgt_layout', 1)) != 1:
+        return None
+
+    in_h = int(_lf_get(conv, 'in_h', 0))
+    in_w = int(_lf_get(conv, 'in_w', 0))
+    in_c = int(_lf_get(conv, 'in_c', 0))
+    out_h = int(_lf_get(conv, 'out_h', 0))
+    out_w = int(_lf_get(conv, 'out_w', 0))
+    out_c = int(_lf_get(conv, 'out_c', 0))
+    pool_out_h = int(_lf_get(pool, 'out_h', 0))
+    pool_out_w = int(_lf_get(pool, 'out_w', 0))
+    pool_out_c = int(_lf_get(pool, 'out_c', 0))
+
+    if (out_h, out_w, out_c) != (int(_lf_get(pool, 'in_h', 0)),
+                                 int(_lf_get(pool, 'in_w', 0)),
+                                 int(_lf_get(pool, 'in_c', 0))):
+        return None
+
+    # Parse pool kernel/stride/global from either LayerConfig or metadata dict
+    if hasattr(pool, 'pool_h'):
+        pool_h = int(pool.pool_h)
+        pool_w = int(pool.pool_w)
+        pool_sh = int(pool.pool_stride_h)
+        global_pool = int(pool.global_pool)
+    else:
+        pcfg = int(pool.get('pool_cfg', 0))
+        pool_h = (pcfg >> 4) & 0xF
+        pool_w = (pcfg >> 8) & 0xF
+        pool_sh = (pcfg >> 12) & 0xF
+        global_pool = (pcfg >> 20) & 0x1
+
+    if global_pool or pool_h == 0 or pool_w == 0 or pool_sh == 0 or pool_out_h == 0:
+        return None
+
+    # Direct NHWC row slicing requires word-aligned input rows and pool output rows
+    if (in_w * in_c) % 4 != 0 or (pool_out_w * pool_out_c) % 4 != 0:
+        return None
+
+    # Skip pairs that already fit completely untiled in SRAM
+    if (int(_lf_get(conv, 'tile_h', 0)) == 0
+            and int(_lf_get(pool, 'tile_h', 0)) == 0
+            and max(in_h * in_w * in_c, out_h * out_w * out_c,
+                    pool_out_h * pool_out_w * pool_out_c) <= untiled_cap):
+        return None
+
+    kh = int(_lf_get(conv, 'kernel_h', 1))
+    kw = int(_lf_get(conv, 'kernel_w', 1))
+    dh = max(1, int(_lf_get(conv, 'dilation_h', 1)))
+    sh = int(_lf_get(conv, 'stride_h', 1))
+    kh_eff = (kh - 1) * dh + 1
+
+    conv_wgt_bytes = out_c * kh * kw * in_c
+    if conv_wgt_bytes > wgt_bytes_cap or out_c > param_max_ch:
+        return None
+    if int(_lf_get(conv, 'wgt_per_oc_words', 0)) != 0:
+        return None
+
+    pool_strip_h = 0
+    for cand in range(1, pool_out_h + 1):
+        prod_h = min(out_h, (cand - 1) * pool_sh + pool_h)
+        conv_in_h = min(in_h, (prod_h - 1) * sh + kh_eff)
+        conv_in_bytes = conv_in_h * in_w * in_c
+        prod_bytes = prod_h * out_w * out_c
+        pool_out_bytes = cand * pool_out_w * pool_out_c
+        if (conv_in_bytes > ifm_bytes
+                or prod_bytes > ofm_bytes
+                or pool_out_bytes > ifm_bytes):
+            break
+        pool_strip_h = cand
+
+    if pool_strip_h == 0:
+        return None
+
+    producer_h = min(out_h, (pool_strip_h - 1) * pool_sh + pool_h)
+    strip_count = (pool_out_h + pool_strip_h - 1) // pool_strip_h
+    conv_in_strip_h = min(in_h, (producer_h - 1) * sh + kh_eff)
+
+    # Bandwidth cost model: ensure reloading Conv wgt/param per strip + halo rows
+    # saves at least 25% of the Conv<->Pool intermediate DDR round-trip.
+    inter_bytes = out_h * out_w * out_c
+    reload_cost = (strip_count - 1) * (conv_wgt_bytes + out_c * 16)
+    halo_rows = max(0, strip_count * conv_in_strip_h - in_h)
+    halo_cost = halo_rows * in_w * in_c
+    if reload_cost + halo_cost >= int(1.5 * inter_bytes):
+        return None
+
+    return (pool_strip_h, producer_h, strip_count)
+
+
+def apply_conv_pool_strip_fusion(layers, profile: HWConfig = None,
+                                 must_store_indices=None,
+                                 stamp_firmware_fields: bool = False) -> List[tuple]:
+    """Mark eligible Conv -> Pool pairs with SCHED_CTRL_FUSE_STRIP.
+
+    When stamp_firmware_fields=False (in onnx_converter), only sets bit 5 of
+    sched_ctrl while preserving valid NPU1 tile grids for CSIM.
+    When stamp_firmware_fields=True (in gen_soc_test), writes the firmware
+    strip parameters into tile_h/w/num_h/num_w and tile_in_size=0.
+    """
+    if profile is None:
+        profile = DEFAULT_HW
+    referenced = _collect_referenced(layers, must_store_indices)
+    marked = []
+    n = len(layers)
+    i = 0
+    while i + 1 < n:
+        conv, pool = layers[i], layers[i + 1]
+        c_sched = int(_lf_get(conv, 'sched_ctrl', 0))
+        p_sched = int(_lf_get(pool, 'sched_ctrl', 0))
+        if (c_sched & (_SUPER_BLOCK | _FUSE_START | _FUSE_MID | _FUSE_END)) or \
+           (p_sched & (_SUPER_BLOCK | _FUSE_START | _FUSE_MID | _FUSE_END)):
+            i += 1
+            continue
+        # If L0 already received legacy fuse_input slot_bytes > 0, keep it untouched
+        if (c_sched & _FUSE_STRIP) and int(_lf_get(conv, 'tile_in_size', 0)) > 0:
+            i += 2
+            continue
+        if i in referenced:
+            i += 1
+            continue
+        p_src = int(_lf_get(pool, 'input_src', -1))
+        if p_src not in (-1, i):
+            i += 1
+            continue
+
+        params = compute_conv_pool_strip_params(conv, pool, profile=profile)
+        if params is None:
+            i += 1
+            continue
+
+        pool_strip_h, producer_h, strip_count = params
+        _lf_set(conv, 'sched_ctrl', c_sched | _FUSE_STRIP)
+        if stamp_firmware_fields:
+            _lf_set(conv, 'tile_h', producer_h)
+            _lf_set(conv, 'tile_w', int(_lf_get(conv, 'out_w')))
+            _lf_set(conv, 'tile_num_h', strip_count)
+            _lf_set(conv, 'tile_num_w', pool_strip_h)
+            _lf_set(conv, 'tile_in_size', 0)
+        marked.append((i, i + 1, strip_count, producer_h, pool_strip_h))
+        i += 2
+
+    return marked
+
+
+def apply_untiled_sram_fusion(layers, profile: HWConfig = None,
+                              must_store_indices=None) -> List[tuple]:
+    """Fuse maximal chains of untiled layers through IFM/OFM SRAM role swap."""
+    if profile is None:
+        profile = DEFAULT_HW
+    cap_bytes = min(profile.act_bank_size, profile.ofm_bank_size)
+    referenced = _collect_referenced(layers, must_store_indices)
+
+    def _can_link(k: int) -> bool:
+        prod, cons = layers[k], layers[k + 1]
+        if k in referenced:
+            return False
+        if k > 0 and (int(_lf_get(layers[k - 1], 'sched_ctrl', 0)) & _FUSE_STRIP):
+            return False
+        if k >= 2 and (int(_lf_get(layers[k - 2], 'sched_ctrl', 0)) & _SUPER_BLOCK):
+            return False
+        if k >= 1 and (int(_lf_get(layers[k - 1], 'sched_ctrl', 0)) & _SUPER_BLOCK):
+            return False
+        ps = int(_lf_get(prod, 'sched_ctrl', 0))
+        cs = int(_lf_get(cons, 'sched_ctrl', 0))
+        if (ps & (_SUPER_BLOCK | _FUSE_STRIP | _DB_EN)) or \
+           (cs & (_SUPER_BLOCK | _FUSE_STRIP | _DB_EN)):
+            return False
+        if int(_lf_get(prod, 'tile_h', 0)) != 0 or int(_lf_get(cons, 'tile_h', 0)) != 0:
+            return False
+        p_op = int(_lf_get(prod, 'op_type', -1))
+        c_op = int(_lf_get(cons, 'op_type', -1))
+        if p_op not in (0, 1, 2, 3, 5) or c_op not in (0, 1, 2, 3, 5):
+            return False
+        c_src = int(_lf_get(cons, 'input_src', -1))
+        if c_src not in (-1, k):
+            return False
+        p_dt = int(_lf_get(prod, 'data_type', 0))
+        c_dt = int(_lf_get(cons, 'data_type', 0))
+        if p_dt != c_dt:
+            return False
+        eb = 2 if p_dt else 1
+        p_oh, p_ow, p_oc = int(_lf_get(prod, 'out_h')), int(_lf_get(prod, 'out_w')), int(_lf_get(prod, 'out_c'))
+        c_ih, c_iw, c_ic = int(_lf_get(cons, 'in_h')), int(_lf_get(cons, 'in_w')), int(_lf_get(cons, 'in_c'))
+        shape_match = ((p_oh, p_ow, p_oc) == (c_ih, c_iw, c_ic)
+                       or (c_op == 2 and c_ih == 1 and c_iw == 1 and p_oh * p_ow * p_oc == c_ic))
+        if not shape_match:
+            return False
+        p_in_b = int(_lf_get(prod, 'in_h')) * int(_lf_get(prod, 'in_w')) * int(_lf_get(prod, 'in_c')) * eb
+        p_out_b = p_oh * p_ow * p_oc * eb
+        c_in_b = c_ih * c_iw * c_ic * eb
+        c_out_b = int(_lf_get(cons, 'out_h')) * int(_lf_get(cons, 'out_w')) * int(_lf_get(cons, 'out_c')) * eb
+        if max(p_in_b, p_out_b, c_in_b, c_out_b) > cap_bytes:
+            return False
+        return True
+
+    chains = []
+    n = len(layers)
+    i = 0
+    while i + 1 < n:
+        if not _can_link(i):
+            i += 1
+            continue
+        end = i + 1
+        while end + 1 < n and _can_link(end):
+            end += 1
+        for k in range(i, end + 1):
+            sched = int(_lf_get(layers[k], 'sched_ctrl', 0)) & ~(_FUSE_START | _FUSE_MID | _FUSE_END)
+            if k == i:
+                sched |= _FUSE_START
+            elif k == end:
+                sched |= _FUSE_END
+            else:
+                sched |= _FUSE_MID
+            _lf_set(layers[k], 'sched_ctrl', sched)
+        chains.append(tuple(range(i, end + 1)))
+        i = end + 1
+
+    return chains
 
 
 def estimate_fusion_savings(block: FusedBlock, tiling: FusedTiling,

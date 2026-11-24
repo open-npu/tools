@@ -13,6 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 """
 
 import argparse
+import copy
 import math
 import os
 import sys
@@ -20,7 +21,7 @@ import glob
 import tempfile
 import numpy as np
 import onnx
-from onnx import numpy_helper, shape_inference
+from onnx import helper, numpy_helper, shape_inference
 import onnxruntime as ort
 from PIL import Image
 
@@ -35,10 +36,13 @@ from model_packer import (
     POST_BIAS_EN, POST_ZP_EN, POST_RELU_EN, POST_RELU6_EN, POST_INT16_OUT,
     PPU_MODE_CONV_REQ, PPU_MODE_ADD, PPU_MODE_RELU_ONLY, PPU_MODE_PASSTHROUGH,
     SCHED_CTRL_DB_EN, SCHED_CTRL_FUSE_START, SCHED_CTRL_FUSE_MID, SCHED_CTRL_FUSE_END,
-    SCHED_CTRL_PER_TILE_STORE,
+    SCHED_CTRL_PER_TILE_STORE, SCHED_CTRL_FUSE_STRIP, SCHED_CTRL_SUPER_BLOCK,
 )
 from tiling import compute_tiling
-from layer_fusion import detect_fusible_blocks, compute_fused_tiling, stamp_fused_tiling
+from layer_fusion import (
+    detect_fusible_blocks, compute_fused_tiling, stamp_fused_tiling,
+    apply_super_block_fusion, apply_conv_pool_strip_fusion, apply_untiled_sram_fusion,
+)
 from hw_config import DEFAULT_HW, add_hw_args, hw_config_from_args
 from ptq_mse_admm import (
     mse_clip_range, admm_quantize_weight_perchannel, reservoir_chunks,
@@ -119,10 +123,271 @@ class OnnxNode:
         self.output_shape = shape_map.get(node.output[0]) if len(node.output) > 0 else None
 
 
-def parse_onnx_graph(model_path):
-    """Parse ONNX model into list of OnnxNodes."""
-    model = onnx.load(model_path)
+def normalize_onnx_model(model):
+    """Normalize an ONNX ModelProto prior to calibration and NPU IR lowering.
+
+    1. Decomposes PRelu(x, alpha) into exact standard NPU ops:
+         Relu(x) + (-alpha) * Relu(-x)
+       fusing the sign flip directly into a single-consumer preceding Conv when
+       present to avoid extra quantization stages.
+    2. Folds dynamic Reshape target-shape subgraphs (Shape/Gather/Unsqueeze/Concat)
+       into static INT64 initializers using inferred output shapes.
+    3. Strips terminal post-processing heads (Sigmoid / Softmax) that feed
+       graph.output with no internal consumers.
+    4. Prunes dead shape/metadata nodes and non-float value_info entries so
+       ONNX Runtime calibration only inspects live float activation tensors.
+    """
+    model = copy.deepcopy(model)
     model = shape_inference.infer_shapes(model)
+
+    init_map = {}
+    for init in model.graph.initializer:
+        init_map[init.name] = numpy_helper.to_array(init)
+    for node in model.graph.node:
+        if node.op_type == 'Constant' and node.output:
+            for attr in node.attribute:
+                if attr.name == 'value':
+                    init_map[node.output[0]] = numpy_helper.to_array(attr.t)
+
+    def _build_shape_map(m):
+        smap = {}
+        for seq in (m.graph.value_info, m.graph.input, m.graph.output):
+            for vi in seq:
+                if vi.type.HasField('tensor_type') and vi.type.tensor_type.HasField('shape'):
+                    smap[vi.name] = [d.dim_value for d in vi.type.tensor_type.shape.dim]
+        return smap
+
+    shape_map = _build_shape_map(model)
+
+    # ── Pass 1: PRelu exact decomposition ──
+    has_prelu = any(n.op_type == 'PRelu' for n in model.graph.node)
+    if has_prelu:
+        consumer_counts = {}
+        producer_map = {}
+        for n in model.graph.node:
+            for inp in n.input:
+                if inp:
+                    consumer_counts[inp] = consumer_counts.get(inp, 0) + 1
+            for out in n.output:
+                if out:
+                    producer_map[out] = n
+        graph_out_names = {o.name for o in model.graph.output}
+
+        graph_in_names = {i.name for i in model.graph.input}
+        replaced_convs = set()
+        for n in model.graph.node:
+            if n.op_type != 'PRelu':
+                continue
+            x_name = n.input[0]
+            prev = producer_map.get(x_name)
+            if (prev is not None and prev.op_type == 'Conv'
+                    and prev.input[0] not in graph_in_names
+                    and consumer_counts.get(x_name, 0) == 1
+                    and x_name not in graph_out_names
+                    and len(prev.input) >= 2 and prev.input[1] in init_map):
+                replaced_convs.add(id(prev))
+
+        new_nodes = []
+        prelu_count = 0
+        for idx_n, n in enumerate(model.graph.node):
+            if id(n) in replaced_convs:
+                continue  # emitted inline at its consuming PRelu
+            if n.op_type != 'PRelu':
+                new_nodes.append(n)
+                continue
+
+            x_name, slope_name = n.input[0], n.input[1]
+            y_name = n.output[0]
+            if slope_name not in init_map:
+                raise ValueError(f"PRelu '{n.name or y_name}' has non-constant slope '{slope_name}'")
+            slope_raw = init_map[slope_name].astype(np.float32).reshape(-1)
+            x_shape = shape_map.get(x_name)
+            ch = x_shape[1] if (x_shape and len(x_shape) >= 2 and x_shape[1] > 0) else slope_raw.size
+            if slope_raw.size == 1 and ch > 1:
+                slope = np.full((ch,), float(slope_raw[0]), dtype=np.float32)
+            elif slope_raw.size == ch:
+                slope = slope_raw
+            else:
+                raise ValueError(f"PRelu slope size {slope_raw.size} != channel count {ch}")
+
+            uid = f"__prelu_{idx_n}"
+            prev = producer_map.get(x_name)
+            if prev is not None and id(prev) in replaced_convs:
+                w_pos = init_map[prev.input[1]].astype(np.float32)
+                b_pos = (init_map[prev.input[2]].astype(np.float32)
+                         if len(prev.input) > 2 and prev.input[2] in init_map
+                         else np.zeros((ch,), dtype=np.float32))
+
+                pos_pre = f"{y_name}{uid}_pos_pre"
+                pos_out = f"{y_name}{uid}_pos_relu"
+                conv_pos = copy.deepcopy(prev)
+                conv_pos.output[:] = [pos_pre]
+                relu_pos = helper.make_node('Relu', [pos_pre], [pos_out], name=f"{uid}_relu_pos")
+
+                w_neg_name = f"{prev.input[1]}{uid}_neg_w"
+                b_neg_name = f"{prev.input[1]}{uid}_neg_b"
+                model.graph.initializer.append(numpy_helper.from_array((-w_pos).astype(np.float32), name=w_neg_name))
+                model.graph.initializer.append(numpy_helper.from_array((-b_pos).astype(np.float32), name=b_neg_name))
+
+                neg_pre = f"{y_name}{uid}_neg_pre"
+                neg_relu = f"{y_name}{uid}_neg_relu"
+                conv_neg = copy.deepcopy(prev)
+                conv_neg.name = (prev.name or y_name) + f"{uid}_conv_neg"
+                conv_neg.input[:] = [prev.input[0], w_neg_name, b_neg_name]
+                conv_neg.output[:] = [neg_pre]
+                relu_neg = helper.make_node('Relu', [neg_pre], [neg_relu], name=f"{uid}_relu_neg")
+                new_nodes.extend([conv_pos, relu_pos, conv_neg, relu_neg])
+            else:
+                eye = np.zeros((ch, ch, 1, 1), dtype=np.float32)
+                eye[np.arange(ch), np.arange(ch), 0, 0] = 1.0
+                w_pos_name = f"{y_name}{uid}_id_pos_w"
+                w_neg_name = f"{y_name}{uid}_id_neg_w"
+                model.graph.initializer.append(numpy_helper.from_array(eye, name=w_pos_name))
+                model.graph.initializer.append(numpy_helper.from_array(-eye, name=w_neg_name))
+
+                pos_pre = f"{y_name}{uid}_pos_pre"
+                pos_out = f"{y_name}{uid}_pos_relu"
+                neg_pre = f"{y_name}{uid}_neg_pre"
+                neg_relu = f"{y_name}{uid}_neg_relu"
+                new_nodes.extend([
+                    helper.make_node('Conv', [x_name, w_pos_name], [pos_pre],
+                                     name=f"{uid}_conv_pos", kernel_shape=[1, 1]),
+                    helper.make_node('Relu', [pos_pre], [pos_out], name=f"{uid}_relu_pos"),
+                    helper.make_node('Conv', [x_name, w_neg_name], [neg_pre],
+                                     name=f"{uid}_conv_neg", kernel_shape=[1, 1]),
+                    helper.make_node('Relu', [neg_pre], [neg_relu], name=f"{uid}_relu_neg"),
+                ])
+
+            w_scale = np.zeros((ch, ch, 1, 1), dtype=np.float32)
+            w_scale[np.arange(ch), np.arange(ch), 0, 0] = -slope
+            w_scale_name = f"{y_name}{uid}_scale_w"
+            model.graph.initializer.append(numpy_helper.from_array(w_scale, name=w_scale_name))
+            neg_scaled = f"{y_name}{uid}_neg_scaled"
+            conv_scale = helper.make_node('Conv', [neg_relu, w_scale_name], [neg_scaled],
+                                          name=f"{uid}_conv_scale", kernel_shape=[1, 1])
+            add_node = helper.make_node('Add', [pos_out, neg_scaled], [y_name],
+                                        name=f"{uid}_add")
+            new_nodes.extend([conv_scale, add_node])
+            prelu_count += 1
+
+        del model.graph.node[:]
+        model.graph.node.extend(new_nodes)
+        del model.graph.value_info[:]
+        model = shape_inference.infer_shapes(model)
+        shape_map = _build_shape_map(model)
+        for init in model.graph.initializer:
+            if init.name not in init_map:
+                init_map[init.name] = numpy_helper.to_array(init)
+        print(f"  Normalized {prelu_count} PRelu node(s) into exact Conv+ReLU+Add subgraphs")
+
+    # ── Pass 2: Fold dynamic Reshape shape inputs into static initializers ──
+    dyn_reshapes = [
+        (idx_n, n) for idx_n, n in enumerate(model.graph.node)
+        if n.op_type == 'Reshape' and len(n.input) >= 2 and n.input[1] not in init_map
+    ]
+    if dyn_reshapes:
+        # Static shape_inference leaves dynamic Concat([Gather(Shape(x)), -1])
+        # outputs unknown ([0, 0]). Evaluate concrete shapes once via ORT when needed.
+        need_ort = [
+            n.output[0] for _, n in dyn_reshapes
+            if not (shape_map.get(n.output[0]) and all(d > 0 for d in shape_map[n.output[0]]))
+        ]
+        if need_ort:
+            probe_m = copy.deepcopy(model)
+            existing_outs = {o.name for o in probe_m.graph.output}
+            for tname in need_ort:
+                if tname not in existing_outs:
+                    probe_m.graph.output.append(
+                        helper.make_tensor_value_info(tname, onnx.TensorProto.FLOAT, None))
+            in_vi = probe_m.graph.input[0]
+            in_dims = [max(1, d.dim_value) for d in in_vi.type.tensor_type.shape.dim]
+            sess_p = ort.InferenceSession(probe_m.SerializeToString(),
+                                          providers=['CPUExecutionProvider'])
+            outs_p = sess_p.run(need_ort, {in_vi.name: np.zeros(in_dims, dtype=np.float32)})
+            for tname, val in zip(need_ort, outs_p):
+                shape_map[tname] = list(val.shape)
+
+        folded_reshapes = 0
+        for idx_n, n in dyn_reshapes:
+            out_dims = shape_map.get(n.output[0])
+            if out_dims and all(d > 0 for d in out_dims):
+                sname = f"{n.output[0]}__static_shape_{idx_n}"
+                arr = np.array(out_dims, dtype=np.int64)
+                model.graph.initializer.append(numpy_helper.from_array(arr, name=sname))
+                init_map[sname] = arr
+                n.input[1] = sname
+                folded_reshapes += 1
+        if folded_reshapes:
+            print(f"  Folded {folded_reshapes} dynamic Reshape shape subgraph(s) to static initializers")
+
+    # ── Pass 3: Strip terminal Sigmoid / Softmax post-processing heads ──
+    consumer_counts = {}
+    producer_map = {}
+    for n in model.graph.node:
+        for inp in n.input:
+            if inp:
+                consumer_counts[inp] = consumer_counts.get(inp, 0) + 1
+        for out in n.output:
+            if out:
+                producer_map[out] = n
+
+    stripped_heads = []
+    for out_idx, out_vi in enumerate(model.graph.output):
+        prod = producer_map.get(out_vi.name)
+        if (prod is not None
+                and prod.op_type in ('Sigmoid', 'Softmax')
+                and consumer_counts.get(out_vi.name, 0) == 0):
+            stripped_heads.append((out_idx, prod.op_type, out_vi.name, prod.input[0]))
+            out_vi.name = prod.input[0]
+    if stripped_heads:
+        print("  Stripped terminal post-processing head(s): "
+              + ", ".join(f"{op}({old}->{new})" for _, op, old, new in stripped_heads))
+
+    # ── Pass 4: Backward live-node reachability pruning ──
+    producer_idx = {}
+    for idx_n, n in enumerate(model.graph.node):
+        for out in n.output:
+            if out:
+                producer_idx[out] = idx_n
+
+    live_node_idxs = set()
+    worklist = [o.name for o in model.graph.output]
+    visited_tensors = set()
+    while worklist:
+        tname = worklist.pop()
+        if not tname or tname in visited_tensors:
+            continue
+        visited_tensors.add(tname)
+        pidx = producer_idx.get(tname)
+        if pidx is not None and pidx not in live_node_idxs:
+            live_node_idxs.add(pidx)
+            for inp in model.graph.node[pidx].input:
+                if inp:
+                    worklist.append(inp)
+
+    if len(live_node_idxs) < len(model.graph.node):
+        pruned_n = len(model.graph.node) - len(live_node_idxs)
+        kept_nodes = [n for idx_n, n in enumerate(model.graph.node) if idx_n in live_node_idxs]
+        del model.graph.node[:]
+        model.graph.node.extend(kept_nodes)
+        print(f"  Pruned {pruned_n} dead metadata/postproc node(s)")
+
+    live_outputs = {out for n in model.graph.node for out in n.output if out}
+    live_inputs = {inp for n in model.graph.node for inp in n.input if inp}
+    live_tensors = live_outputs | live_inputs | {o.name for o in model.graph.output}
+    kept_inits = [init for init in model.graph.initializer if init.name in live_tensors]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(kept_inits)
+    del model.graph.value_info[:]
+    model = shape_inference.infer_shapes(model)
+
+    return model, stripped_heads
+
+
+def _parse_onnx_graph_ext(model_path):
+    """Parse normalized ONNX model and return multi-output metadata."""
+    raw_model = onnx.load(model_path)
+    model, stripped_heads = normalize_onnx_model(raw_model)
 
     # Build weight map
     weights = {}
@@ -153,14 +418,21 @@ def parse_onnx_graph(model_path):
 
     input_name = model.graph.input[0].name
     input_shape = shape_map[input_name]
-    output_name = model.graph.output[0].name
+    output_names = [o.name for o in model.graph.output]
 
-    return nodes, input_name, input_shape, output_name, weights
+    return model, nodes, input_name, input_shape, output_names, weights, stripped_heads
+
+
+def parse_onnx_graph(model_path):
+    """Parse ONNX model into list of OnnxNodes."""
+    _, nodes, input_name, input_shape, output_names, weights, _ = _parse_onnx_graph_ext(model_path)
+    return nodes, input_name, input_shape, output_names[0], weights
 
 
 # ─── Calibration: collect activation ranges ───
 
-def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None, std=None):
+def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None, std=None,
+                    normalized_model=None):
     """Run calibration images through ONNX Runtime to collect per-tensor activation ranges.
 
     Args:
@@ -174,13 +446,17 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
     """
     print(f"Calibrating with images from: {calib_dir}")
 
-    # Get all intermediate tensor names
-    model = onnx.load(model_path)
-    model = shape_inference.infer_shapes(model)
+    # Get all intermediate float tensor names on the normalized graph
+    if normalized_model is not None:
+        model = copy.deepcopy(normalized_model)
+    else:
+        model, _ = normalize_onnx_model(onnx.load(model_path))
 
     tensor_names = set()
     for vi in model.graph.value_info:
-        tensor_names.add(vi.name)
+        if (vi.type.HasField('tensor_type')
+                and vi.type.tensor_type.elem_type in (0, onnx.TensorProto.FLOAT)):
+            tensor_names.add(vi.name)
     for inp in model.graph.input:
         tensor_names.add(inp.name)
 
@@ -448,22 +724,26 @@ def compute_requant_params(scale_in, scale_w_perchannel, scale_out, bias_float=N
 # ─── Graph Fusion ───
 
 def fold_batchnorm(nodes, weights):
-    """Fold BatchNormalization into preceding Conv weight/bias (float32 level).
+    """Fold BatchNormalization into preceding Conv/Gemm/MatMul weight/bias (float32 level).
 
-    For each BN node immediately following a Conv:
+    For each BN node immediately following a single-consumer Conv, Gemm, or
+    constant-weight MatMul:
         w_new = w * (gamma / sqrt(var + eps))
         b_new = (b - mean) * (gamma / sqrt(var + eps)) + beta
 
-    Modifies weights dict in-place and removes BN nodes from graph.
-    Returns filtered nodes list.
+    Modifies weights dict in-place, updates producer output name to the post-BN
+    tensor (preserving calibrated post-BN activation ranges and graph outputs),
+    and removes folded BN nodes from graph.
     """
-    # Map: output_tensor_name → node (to find Conv preceding BN)
     output_to_node = {}
+    consumer_counts = {}
     for node in nodes:
+        for inp in node.inputs:
+            if inp:
+                consumer_counts[inp] = consumer_counts.get(inp, 0) + 1
         for out in node.outputs:
             output_to_node[out] = node
 
-    bn_outputs_to_conv_output = {}  # BN output → Conv output (for redirect)
     bn_nodes_to_remove = set()
 
     for node in nodes:
@@ -475,8 +755,12 @@ def fold_batchnorm(nodes, weights):
             continue
 
         bn_input = node.inputs[0]
-        conv_node = output_to_node.get(bn_input)
-        if conv_node is None or conv_node.op_type != 'Conv':
+        if consumer_counts.get(bn_input, 0) != 1:
+            continue
+        pred_node = output_to_node.get(bn_input)
+        if pred_node is None or pred_node.op_type not in ('Conv', 'Gemm', 'MatMul'):
+            continue
+        if len(pred_node.inputs) < 2 or pred_node.inputs[1] not in weights:
             continue
 
         # Extract BN parameters from weights
@@ -490,51 +774,76 @@ def fold_batchnorm(nodes, weights):
         eps = node.attrs.get('epsilon', 1e-5)
 
         # Compute fold factors
-        inv_std = gamma / np.sqrt(var + eps)  # shape [C]
+        inv_std = (gamma / np.sqrt(var + eps)).astype(np.float32).reshape(-1)
         C = inv_std.shape[0]
+        weight_name = pred_node.inputs[1]
+        w = weights[weight_name].astype(np.float32)
 
-        # Fold into Conv weight
-        conv_weight_name = conv_node.inputs[1]
-        w = weights[conv_weight_name]  # [OC, IC/g, KH, KW] or [OC, 1, KH, KW] for DW
-        w_new = w * inv_std.reshape(C, *([1] * (w.ndim - 1)))
-        weights[conv_weight_name] = w_new
-        conv_node.weight = w_new
-
-        # Fold into Conv bias (create if absent)
-        if len(conv_node.inputs) > 2 and conv_node.inputs[2] in weights:
-            bias_name = conv_node.inputs[2]
-            b = weights[bias_name]
-        else:
-            # No bias — create zero bias and add to Conv inputs
-            b = np.zeros(C, dtype=np.float32)
-            bias_name = conv_weight_name + '_folded_bias'
-            if len(conv_node.inputs) <= 2:
-                conv_node.inputs.append(bias_name)
+        if pred_node.op_type == 'Conv':
+            if w.shape[0] != C:
+                continue
+            w_new = w * inv_std.reshape(C, *([1] * (w.ndim - 1)))
+            alpha = 1.0
+            beta_fc = 1.0
+        elif pred_node.op_type == 'Gemm':
+            if pred_node.attrs.get('transA', 0) != 0 or w.ndim != 2:
+                continue
+            alpha = float(pred_node.attrs.get('alpha', 1.0))
+            beta_fc = float(pred_node.attrs.get('beta', 1.0))
+            transB = pred_node.attrs.get('transB', 0)
+            if transB:
+                if w.shape[0] != C:
+                    continue
+                w_new = (w * alpha) * inv_std.reshape(C, 1)
             else:
-                conv_node.inputs[2] = bias_name
+                if w.shape[1] != C:
+                    continue
+                w_new = (w * alpha) * inv_std.reshape(1, C)
+            pred_node.attrs['alpha'] = 1.0
+            pred_node.attrs['beta'] = 1.0
+        else:  # MatMul
+            if w.ndim != 2 or w.shape[1] != C:
+                continue
+            w_new = w * inv_std.reshape(1, C)
+            alpha = 1.0
+            beta_fc = 1.0
 
-        b_new = (b - mean) * inv_std + beta
+        weights[weight_name] = w_new
+        pred_node.weight = w_new
+
+        # Fold into bias (create if absent, including on MatMul)
+        if len(pred_node.inputs) > 2 and pred_node.inputs[2] in weights:
+            bias_name = pred_node.inputs[2]
+            b = weights[bias_name].astype(np.float32) * beta_fc
+        else:
+            b = np.zeros(C, dtype=np.float32)
+            bias_name = weight_name + '_folded_bias'
+            if len(pred_node.inputs) <= 2:
+                pred_node.inputs.append(bias_name)
+            else:
+                pred_node.inputs[2] = bias_name
+
+        b_new = ((b - mean.astype(np.float32)) * inv_std + beta.astype(np.float32)).astype(np.float32)
         weights[bias_name] = b_new
-        conv_node.bias = b_new
+        pred_node.bias = b_new
 
-        # Redirect: BN output → Conv output (downstream nodes use Conv output)
+        # Producer now directly emits the post-BN tensor name
         bn_output = node.outputs[0]
-        conv_output = conv_node.outputs[0]
-        bn_outputs_to_conv_output[bn_output] = conv_output
+        pred_node.outputs[0] = bn_output
+        if node.output_shape:
+            pred_node.output_shape = node.output_shape
+        output_to_node[bn_output] = pred_node
         bn_nodes_to_remove.add(id(node))
 
     if not bn_nodes_to_remove:
         return nodes
 
-    # Redirect all downstream references from BN outputs to Conv outputs
-    for node in nodes:
-        for i, inp in enumerate(node.inputs):
-            if inp in bn_outputs_to_conv_output:
-                node.inputs[i] = bn_outputs_to_conv_output[inp]
-
-    # Remove BN nodes
+    # Remove folded BN nodes; raise if an unfoldable standalone BN remains
     filtered = [n for n in nodes if id(n) not in bn_nodes_to_remove]
-    print(f"  Folded {len(bn_nodes_to_remove)} BatchNorm nodes into Conv")
+    leftover_bn = [n.name or n.outputs[0] for n in filtered if n.op_type == 'BatchNormalization']
+    if leftover_bn:
+        raise ValueError(f"Unfolded standalone BatchNormalization node(s): {leftover_bn}")
+    print(f"  Folded {len(bn_nodes_to_remove)} BatchNorm node(s) into Conv/FC")
     return filtered
 
 
@@ -817,15 +1126,18 @@ def convert_model(model_path, calib_dir, input_path, output_path,
 
     # 1. Parse graph
     print(f"=== Parsing ONNX model (INT{bits} mode) ===")
-    nodes, input_name, input_shape, output_name, all_weights = parse_onnx_graph(model_path)
+    norm_model, nodes, input_name, input_shape, output_names, all_weights, stripped_heads = \
+        _parse_onnx_graph_ext(model_path)
+    output_name = output_names[0]
     print(f"  Input: {input_name} {input_shape}")
-    print(f"  Output: {output_name}")
+    print(f"  Output(s): {output_names}")
     print(f"  Nodes: {len(nodes)}")
 
     # 2. Calibrate (with correct mean/std preprocessing to get accurate activation ranges)
     print("\n=== Running PTQ Calibration ===")
     act_ranges, act_percentiles, act_samples = calibrate_model(
-        model_path, calib_dir, input_shape, num_calib, mean=mean, std=std)
+        model_path, calib_dir, input_shape, num_calib, mean=mean, std=std,
+        normalized_model=norm_model)
 
     # 2.5. Fold BatchNorm into Conv (graph optimization, float32 level)
     print("\n=== Folding BatchNorm ===")
@@ -1018,10 +1330,10 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             strides = node.attrs.get('strides', [1, 1])
             pads = node.attrs.get('pads', [0, 0, 0, 0])
             dilations = node.attrs.get('dilations', [1, 1])
-            if dilations != [1, 1]:
+            if (len(dilations) != 2 or dilations[0] < 1 or dilations[1] < 1
+                    or dilations[0] > 255 or dilations[1] > 255):
                 raise ValueError(
-                    f"Unsupported Conv dilation {dilations} in {node.name}; "
-                    "the RTL address generator supports dilation=1 only"
+                    f"Unsupported Conv dilation {dilations} in {node.name}"
                 )
 
             cfg = LayerConfig(
@@ -1278,24 +1590,17 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 print(f"  WARNING: FC weight '{weight_name}' not found, skipping")
                 continue
 
-            # Handle Gemm transB attribute
+            # Handle Gemm transB / MatMul B transpose to [out_c, in_c]
             # ONNX Gemm: Y = alpha * A * B' + beta * C
-            #   transB=1: B' = B^T, so B stored as [out_c, in_c] (already correct)
-            #   transB=0: B stored as [in_c, out_c], need transpose to [out_c, in_c]
-            transB = node.attrs.get('transB', 0) if node.op_type == 'Gemm' else 0
-            if not transB:
-                # transB=0: weight is [in_c, out_c], transpose to [out_c, in_c]
-                weight = weight.T.copy()
-            # After this: weight shape = [out_c, in_c]
-
-            # For MatMul: A=[1, in_c] * B=[in_c, out_c] → [1, out_c]
-            # Weight B needs transpose to become [out_c, in_c]
-            if node.op_type == 'MatMul' and weight.ndim == 2:
-                # MatMul: A * B, B is [in_c, out_c]
-                # Need [out_c, in_c] for our format
-                in_features = node.input_shape[-1] if node.input_shape else weight.shape[0]
-                if weight.shape[0] == in_features:
+            #   transB=1: B stored as [out_c, in_c]
+            #   transB=0: B stored as [in_c, out_c] -> transpose
+            # ONNX MatMul: Y = A * B where B is always [in_c, out_c] -> transpose
+            if node.op_type == 'Gemm':
+                transB = node.attrs.get('transB', 0)
+                if not transB:
                     weight = weight.T.copy()
+            elif node.op_type == 'MatMul' and weight.ndim == 2:
+                weight = weight.T.copy()
 
             out_c, in_c = weight.shape[0], weight.shape[1]
 
@@ -1596,16 +1901,16 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             print(f"    Resize[{len(npu_layers)-1}]: {mode_name} "
                   f"{ih}x{iw}x{ic} → {oh}x{ow}x{oc}")
 
-    # 4b. Compute single-buffer tiling for each layer. Tiled PTS is serialized
-    # as store → next-input load at tile boundaries, so ping/pong cannot overlap
-    # those transfers and only halves usable activation capacity.
+    # 4b. Compute single-buffer tiling and converge double-buffer admission.
     op_type_names = {OP_CONV2D: 'conv', OP_DW_CONV: 'dw', OP_FC: 'fc',
                      OP_POOLING: 'pool', OP_ELTWISE_ADD: 'add',
                      OP_RESIZE: 'resize', OP_CONCAT: 'concat'}
     elem_size = 2 if bits == 16 else 1
+    half_ifm = profile.act_bank_size // 2
+    half_ofm = profile.ofm_bank_size // 2
     tiled_count = 0
     db_count = 0
-    for cfg in npu_layers:
+    for idx_l, cfg in enumerate(npu_layers):
         op_name = op_type_names.get(cfg.op_type, 'conv')
         # Pool layers use pool_h/w as kernel, pool_stride as stride
         if cfg.op_type == OP_POOLING:
@@ -1632,6 +1937,38 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         tile = tile_sb
         cfg.sched_ctrl = 0
 
+        # Converged DB re-tiling: shrink oversized tiles for layers > 0 when
+        # single-OC-group compute can overlap ping/pong prefetch and background
+        # per-tile store.
+        if idx_l > 0 and tile_sb['tile_h'] > 0 and cfg.op_type in (OP_CONV2D, OP_DW_CONV, OP_ELTWISE_ADD):
+            th_sb, tw_sb = tile_sb['tile_h'], tile_sb['tile_w']
+            kh_eff = (eff_kh - 1) * max(1, cfg.dilation_h) + 1
+            kw_eff = (eff_kw - 1) * max(1, cfg.dilation_w) + 1
+            in_th = (th_sb - 1) * eff_sh + kh_eff
+            in_tw = (tw_sb - 1) * eff_sw + kw_eff
+            tile_in_bytes = ((in_th * in_tw * cfg.in_c * elem_size + 3) // 4) * 4
+            need_in = tile_in_bytes * (2 if cfg.op_type == OP_ELTWISE_ADD else 1)
+            tile_out_bytes = th_sb * tw_sb * cfg.out_c * elem_size
+            k_depth = cfg.kernel_h * cfg.kernel_w * cfg.in_c
+            wgt_bytes = (cfg.out_c * k_depth * elem_size) if cfg.op_type == OP_CONV2D else 0
+            group_major = (cfg.op_type == OP_CONV2D and wgt_bytes > profile.weight_buf_size)
+            ofm_db_worthwhile = (cfg.op_type == OP_CONV2D and k_depth <= 16)
+            if not group_major and (need_in > half_ifm or (tile_out_bytes > half_ofm and ofm_db_worthwhile)):
+                try:
+                    tile = compute_tiling(
+                        op_type=op_name,
+                        in_h=cfg.in_h, in_w=cfg.in_w, in_c=cfg.in_c,
+                        out_h=cfg.out_h, out_w=cfg.out_w, out_c=cfg.out_c,
+                        kernel_h=eff_kh, kernel_w=eff_kw,
+                        stride_h=eff_sh, stride_w=eff_sw,
+                        dilation_h=cfg.dilation_h, dilation_w=cfg.dilation_w,
+                        elem_size=elem_size,
+                        double_buffer=True,
+                        profile=profile,
+                    )
+                except ValueError:
+                    tile = tile_sb
+
         cfg.tile_h = tile['tile_h']
         cfg.tile_w = tile['tile_w']
         cfg.tile_num_h = tile['tile_num_h']
@@ -1639,6 +1976,21 @@ def convert_model(model_path, calib_dir, input_path, output_path,
         # Per-tile store preserves every spatial tile before bank-0 reuse.
         if tile.get('per_tile_store_en', False):
             cfg.sched_ctrl |= SCHED_CTRL_PER_TILE_STORE
+            # Stamp DB_EN whenever the chosen tile fits both ping/pong halves
+            if idx_l > 0 and cfg.op_type != OP_CONCAT:
+                th_c, tw_c = cfg.tile_h, cfg.tile_w
+                kh_eff = (eff_kh - 1) * max(1, cfg.dilation_h) + 1
+                kw_eff = (eff_kw - 1) * max(1, cfg.dilation_w) + 1
+                in_th = (th_c - 1) * eff_sh + kh_eff
+                in_tw = (tw_c - 1) * eff_sw + kw_eff
+                t_in = ((in_th * in_tw * cfg.in_c * elem_size + 3) // 4) * 4
+                need_in = t_in * (2 if cfg.op_type == OP_ELTWISE_ADD else 1)
+                t_out = th_c * tw_c * cfg.out_c * elem_size
+                w_bytes = (cfg.out_c * cfg.kernel_h * cfg.kernel_w * cfg.in_c * elem_size
+                           if cfg.op_type == OP_CONV2D else 0)
+                if (w_bytes <= profile.weight_buf_size
+                        and need_in <= half_ifm and t_out <= half_ofm):
+                    cfg.sched_ctrl |= SCHED_CTRL_DB_EN
         if cfg.sched_ctrl & SCHED_CTRL_DB_EN:
             db_count += 1
         if tile['tile_num_h'] > 0:
@@ -1646,51 +1998,38 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     print(f"\n=== Tiling: {tiled_count}/{len(npu_layers)} layers need tiling ===")
     print(f"=== DMA mode: {db_count} double-buffer, {len(npu_layers)-db_count} single-buffer ===")
 
-    # 4c. Detect and mark fusible blocks (Conv1×1 → DW3×3 → Conv1×1)
-    OP_STR_MAP = {OP_CONV2D: 'conv', OP_DW_CONV: 'dw', OP_FC: 'fc',
-                  OP_POOLING: 'pool', OP_ELTWISE_ADD: 'add',
-                  OP_RESIZE: 'resize', OP_CONCAT: 'concat'}
+    # 4c. General cross-layer fusion passes:
+    #   (1) Tiled INT8 Conv1x1 -> DW3x3 -> Conv1x1 Super-Block (SCHED_CTRL_SUPER_BLOCK)
+    #   (2) Tiled INT8 Conv -> Pool NHWC Strip Fusion (SCHED_CTRL_FUSE_STRIP)
+    #   (3) Arbitrary-length Untiled SRAM Chain Fusion (FUSE_START / FUSE_MID / FUSE_END)
+    must_store_indices = set()
+    for out_tname in output_names:
+        resolved_out = resolve_passthrough(out_tname)
+        for cand_name in (out_tname, resolved_out, relu_aliases.get(out_tname), relu_aliases.get(resolved_out)):
+            if cand_name and cand_name in tensor_to_layer_idx:
+                must_store_indices.add(tensor_to_layer_idx[cand_name])
+    if npu_layers:
+        must_store_indices.add(len(npu_layers) - 1)
 
-    # Build a list of dicts for detection (layer_fusion expects string op_type)
-    layer_dicts = []
-    for cfg in npu_layers:
-        layer_dicts.append({
-            'op_type': OP_STR_MAP.get(cfg.op_type, 'conv'),
-            'in_h': cfg.in_h, 'in_w': cfg.in_w, 'in_c': cfg.in_c,
-            'out_h': cfg.out_h, 'out_w': cfg.out_w, 'out_c': cfg.out_c,
-            'kernel_h': cfg.kernel_h, 'kernel_w': cfg.kernel_w,
-            'stride_h': cfg.stride_h, 'stride_w': cfg.stride_w,
-        })
-
-    fused_blocks = [] if no_fuse else detect_fusible_blocks(layer_dicts)
-    fused_count = 0
-    for block in fused_blocks:
-        # Largest square-ish tile that fits the two act regions (no extra DMA DB).
-        tiling = compute_fused_tiling(block, elem_size, profile=profile)
-        if not tiling.feasible:
-            continue
-        n_stamped = stamp_fused_tiling(npu_layers, block, tiling, include_add=True)
-        if n_stamped == 0:
-            continue
-        fused_count += 1
-        th = npu_layers[block.start_idx].tile_h
-        tw = npu_layers[block.start_idx].tile_w
-        nh = npu_layers[block.start_idx].tile_num_h
-        nw = npu_layers[block.start_idx].tile_num_w
-        extra = " +Add" if n_stamped > 3 else ""
-        if th == 0:
-            grid = "untiled (fits SRAM, skip-DMA)"
-        else:
-            grid = f"{th}×{tw} × {nh}×{nw} tiles (same grid; skip-DMA needs tile-major)"
-        print(f"    IR L{block.start_idx}-{block.end_idx}{extra}: "
-              f"{block.out_h}×{block.out_w} {block.c_in}→{block.c_mid}→{block.c_out}  {grid}")
-
-    if fused_count > 0:
-        print(f"=== Fusion: {fused_count} IR blocks share a large-tile grid ===")
-    elif no_fuse:
-        print(f"=== Fusion: DISABLED (no_fuse=True) — all layers independent ===")
+    if no_fuse:
+        print("=== Fusion: DISABLED (no_fuse=True) — all layers independent ===")
     else:
-        print(f"=== Fusion: no RTL-supported untiled blocks selected ===")
+        super_marked = apply_super_block_fusion(
+            npu_layers, profile=profile, must_store_indices=must_store_indices)
+        strip_marked = apply_conv_pool_strip_fusion(
+            npu_layers, profile=profile, must_store_indices=must_store_indices,
+            stamp_firmware_fields=False)
+        sram_chains = apply_untiled_sram_fusion(
+            npu_layers, profile=profile, must_store_indices=must_store_indices)
+        print(f"=== Fusion: {len(super_marked)} super-blocks, "
+              f"{len(strip_marked)} conv-pool strips, "
+              f"{len(sram_chains)} untiled SRAM chains ===")
+        for (si, th, tw, nh, nw) in super_marked:
+            print(f"    SUPER L{si}-L{si+2}: tile={th}x{tw} ({nh}x{nw} tiles)")
+        for (ci, pi, sc, ph, psh) in strip_marked:
+            print(f"    STRIP L{ci}->L{pi}: {sc} strips (prod_h={ph}, pool_h={psh})")
+        for ch in sram_chains:
+            print(f"    SRAM  L{ch[0]}..L{ch[-1]} ({len(ch)} layers)")
 
     # 5. Pack model
     print(f"\n=== Packing NPU1 model ({len(npu_layers)} layers) ===")
@@ -1750,7 +2089,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
              output_zp=zp_out,
              input_shape=np.array(input_shape),
              bits=bits,
-             output_elements=npu_layers[-1].out_h * npu_layers[-1].out_w * npu_layers[-1].out_c)
+             output_elements=npu_layers[-1].out_h * npu_layers[-1].out_w * npu_layers[-1].out_c,
+             stripped_postproc=np.array([op for _, op, _, _ in stripped_heads], dtype='U16'))
 
     print(f"  Metadata saved: {meta_path}")
     print(f"\n=== Conversion complete ===")
