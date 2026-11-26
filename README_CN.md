@@ -7,7 +7,7 @@
 产品脚本在 `tools/` 根目录。测试、golden 生成、Phase-1 回归在
 [`internal/`](internal/README.md)。发布时整棵删掉即可（`rm -rf internal/`）。
 
-整机地图：[open-npu/design — open_npu_overview.md](https://github.com/open-npu/design/blob/main/open_npu_overview.md)。融合 / 双缓冲信号：[internal/fused_tiling_notes.md](internal/fused_tiling_notes.md)。
+整机地图：[open-npu/design — open_npu_overview.md](https://github.com/open-npu/design/blob/main/open_npu_overview.md)。
 
 ## 组件
 
@@ -28,7 +28,7 @@ python onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --output model.npu
 
 # 内部（发布时去掉）
 python3 internal/phase1_regression.py
-python3 internal/tests/synth_dw.py
+python3 internal/tests/synth_dw_e2e.py
 ```
 
 ## 依赖

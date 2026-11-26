@@ -281,8 +281,8 @@ def print_tiling_summary(layers_info, label=""):
 
 
 if __name__ == '__main__':
-    # Self-test: verify tiling for synth_res INT8 layers (single vs double buffer)
-    print("=== Tiling Calculator: Single-Buffer vs Double-Buffer (synth_res INT8) ===\n")
+    # Self-test: verify tiling for multi-stage INT8 layers (single vs double buffer)
+    print("=== Tiling Calculator: Single-Buffer vs Double-Buffer (INT8) ===\n")
 
     test_layers = [
         # Layer 0: Conv 7x7/2, 3→32, 224→112

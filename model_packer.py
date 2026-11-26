@@ -681,7 +681,7 @@ def build_test_conv(output_dir: str):
 
 def build_test_dwconv(output_dir: str):
     """
-    Test: Conv → DWConv → Conv (synth_dw-style)
+    Test: Conv → DWConv → Conv (inverted-residual style)
       Layer 0: Conv2D 3×3, 1→8, 8×8, pad=1
       Layer 1: DWConv 3×3, 8ch, stride=2, pad=1 → 4×4×8
       Layer 2: Conv2D 1×1, 8→4 + ReLU

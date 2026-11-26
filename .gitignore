@@ -6,3 +6,19 @@ __pycache__/
 build/
 *.vcd
 *.fst
+core.*
+internal/models/
+internal/quantize/
+internal/local_cells.py
+internal/*_explained.md
+internal/ptq_*.py
+internal/spad_sizing.py
+
+# Only track public benchmark generators (c, e)
+internal/gen/*
+!internal/gen/model_c_*.py
+!internal/gen/model_e_*.py
+
+# Ignore non-public model tests
+internal/tests/model_*
+internal/tests/r*.py

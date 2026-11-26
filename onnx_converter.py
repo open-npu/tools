@@ -54,7 +54,7 @@ from ptq_mse_admm import (
 def preprocess_image_from_file(path, input_shape, mean=None, std=None):
     """Load and preprocess calibration image (resize to HxW, normalize to float32).
 
-    If mean/std are provided, applies rgb_data-style normalization:
+    If mean/std are provided, applies per-channel RGB normalization:
         arr = (pixel/255 - mean) / std
     Otherwise falls back to default:
         arr = (pixel - 127.5) / 255  → range [-0.5, 0.5]
@@ -71,7 +71,7 @@ def preprocess_image_from_file(path, input_shape, mean=None, std=None):
         arr = np.array(img, dtype=np.float32)  # [H,W,3]
         arr = arr.transpose(2, 0, 1)  # [3,H,W]
     if mean is not None and std is not None:
-        # rgb_data-style: normalize to (pixel/255 - mean) / std
+        # Per-channel RGB normalization: (pixel/255 - mean) / std
         mean_arr = np.array(mean, dtype=np.float32).reshape(c, 1, 1)
         std_arr = np.array(std, dtype=np.float32).reshape(c, 1, 1)
         arr = arr / 255.0
@@ -436,7 +436,7 @@ def calibrate_model(model_path, calib_dir, input_shape, num_images=50, mean=None
     """Run calibration images through ONNX Runtime to collect per-tensor activation ranges.
 
     Args:
-        mean, std: If provided, use rgb_data-style normalization for calibration.
+        mean, std: If provided, use per-channel RGB normalization for calibration.
                    This ensures activation ranges are measured with correct input distribution.
 
     Returns:
@@ -2119,9 +2119,9 @@ if __name__ == '__main__':
                         choices=['default', 'mse', 'admm', 'mse_admm'],
                         help='PTQ clip/weight method (default = current INT8 percentile)')
     parser.add_argument('--mean', type=float, nargs=3, default=None,
-                        help='Per-channel input mean (e.g. 0.485 0.456 0.406 for rgb_data)')
+                        help='Per-channel input mean (e.g. 0.485 0.456 0.406)')
     parser.add_argument('--std', type=float, nargs=3, default=None,
-                        help='Per-channel input std (e.g. 0.229 0.224 0.225 for rgb_data)')
+                        help='Per-channel input std (e.g. 0.229 0.224 0.225)')
     add_hw_args(parser)
     args = parser.parse_args()
 

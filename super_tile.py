@@ -1,6 +1,6 @@
 """Eligibility and capacity checks for the controller-owned super-tile ABI.
 
-The strict RTL path supports model_x INT8 stride-1 Conv1x1→DW3x3→PW1x1
+The strict RTL path supports inverted-residual INT8 stride-1 Conv1x1→DW3x3→PW1x1
 blocks at 56², 28², and 14².  Geometry is descriptor-owned and may contain
 multiple tile rows and columns; every tile includes a one-pixel Expand halo.
 """
@@ -15,7 +15,7 @@ OFM_BYTES = 48 * 1024
 WGT_BYTES = 80 * 1024
 PARAM_BYTES = 12 * 1024
 PARAM_BYTES_PER_CHANNEL = 16  # physical RTL table: four 32-bit words/channel
-model_x = {56: (28, 10), 28: (28, 6), 14: (14, 12)}
+STRICT_SUPER_TILE = {56: (28, 10), 28: (28, 6), 14: (14, 12)}
 
 
 @dataclass(frozen=True)
@@ -48,12 +48,12 @@ class SuperTilePlan:
     ofm_peak_bytes: int
 
 
-def model_x(spatial: int) -> tuple[int, int]:
-    """Return the strict RTL tile for a supported square model_x block."""
+def strict_super_tile_for(spatial: int) -> tuple[int, int]:
+    """Return the strict RTL tile for a supported square inverted-residual block."""
     try:
-        return model_x[spatial]
+        return STRICT_SUPER_TILE[spatial]
     except KeyError as exc:
-        raise ValueError(f"unsupported model_x super spatial size: {spatial}") from exc
+        raise ValueError(f"unsupported strict super spatial size: {spatial}") from exc
 
 
 def plan_super_tile(layers: Sequence[SuperLayer], tile_h: int = 14,

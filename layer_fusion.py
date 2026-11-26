@@ -1,7 +1,7 @@
 """
 Open-NPU Layer Fusion: Block Detection and Fused Tiling Calculator
 
-Detects fusible synth_dw-style Inverted Residual Blocks (Conv1×1 → DW3×3 → Conv1×1)
+Detects fusible Inverted Residual Blocks (Conv1×1 → DW3×3 → Conv1×1)
 and computes optimal tiling parameters for fused execution where intermediate tensors
 stay in SRAM (no DRAM round-trip).
 
@@ -842,8 +842,8 @@ def estimate_fusion_savings(block: FusedBlock, tiling: FusedTiling,
 
 # ─── Self-Test ───
 
-def _model_x():
-    """model_x synth_dw-style layer list for testing (simplified)."""
+def _synth_ir_layers():
+    """Synthetic inverted-residual layer list for testing."""
 
     @dataclass
     class L:
@@ -909,8 +909,8 @@ def _model_x():
     return layers
 
 
-def _synth_res_layers():
-    """synth_res half-width layers for testing (no DW, should find 0 blocks)."""
+def _plain_res_layers():
+    """Synthetic residual layers for testing (no DW, should find 0 blocks)."""
 
     @dataclass
     class L:
@@ -949,11 +949,11 @@ if __name__ == '__main__':
     print("Open-NPU Layer Fusion: Block Detection & Fused Tiling Calculator")
     print("=" * 70)
 
-    # ─── Test 1: model_x synth_dw ───
-    print("\n--- model_x (synth_dw-style, 63 layers) ---")
-    model_x = _model_x()
-    blocks = detect_fusible_blocks(model_x)
-    print(f"  Total layers: {len(model_x)}")
+    # ─── Test 1: Synthetic Inverted-Residual Chain ───
+    print("\n--- Synthetic Inverted-Residual Chain (63 layers) ---")
+    ir_chain = _synth_ir_layers()
+    blocks = detect_fusible_blocks(ir_chain)
+    print(f"  Total layers: {len(ir_chain)}")
     print(f"  Detected fusible blocks: {len(blocks)}")
 
     total_unfused_dma = 0
@@ -986,13 +986,13 @@ if __name__ == '__main__':
         print(f"  Total DMA (fused):   {total_fused_dma / 1024:.0f} KB")
         print(f"  Overall DMA saving:  {overall_pct:.1f}%")
 
-    # ─── Test 2: synth_res (no DW blocks, should detect 0) ───
-    print("\n--- synth_res (no DW blocks) ---")
-    synth_res = _synth_res_layers()
-    blocks_r = detect_fusible_blocks(synth_res)
-    print(f"  Total layers: {len(synth_res)}")
+    # ─── Test 2: Plain Residual Chain (no DW blocks, should detect 0) ───
+    print("\n--- Plain Residual Chain (no DW blocks) ---")
+    plain_res = _plain_res_layers()
+    blocks_r = detect_fusible_blocks(plain_res)
+    print(f"  Total layers: {len(plain_res)}")
     print(f"  Detected fusible blocks: {len(blocks_r)} (expected: 0)")
-    assert len(blocks_r) == 0, "False positive! synth_res has no inverted residual blocks"
+    assert len(blocks_r) == 0, "False positive! Plain residual chain has no inverted residual blocks"
     print("  PASS: No false positives")
 
     # ─── Test 3: Non-square feature map (H != W) ───

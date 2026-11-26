@@ -27,7 +27,7 @@ python onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --output model.npu
 
 # Internal (not shipped at release)
 python3 internal/phase1_regression.py
-python3 internal/tests/synth_dw.py
+python3 internal/tests/synth_dw_e2e.py
 ```
 
 ## Requirements
