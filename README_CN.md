@@ -4,9 +4,6 @@
 
 用于 Open-NPU 加速器的神经网络模型转换、量化和打包的 Python 工具链。
 
-产品脚本在 `tools/` 根目录。测试、golden 生成、Phase-1 回归在
-[`internal/`](internal/README.md)。发布时整棵删掉即可（`rm -rf internal/`）。
-
 整机地图：[open-npu/design — open_npu_overview.md](https://github.com/open-npu/design/blob/main/open_npu_overview.md)。
 
 ## 组件
@@ -16,7 +13,8 @@
 | `onnx_converter.py` | ONNX → NPU 二进制转换器（含 PTQ） |
 | `model_packer.py` | NPU 执行用二进制打包 |
 | `tiling.py` | 空间 tiling 策略计算 |
-| `layer_fusion.py` | 层融合（Conv+BN+ReLU、DW super-layer） |
+| `layer_fusion.py` | 层融合（Conv+BN+ReLU、Conv->Pool strip、SRAM chain） |
+| `super_tile.py` | 空间 Super-Block 融合规划 |
 | `hw_config.py` | 硬件配置参数 |
 | `ptq_mse_admm.py` | 转换器使用的 MSE clip / ADMM |
 
@@ -24,11 +22,10 @@
 
 ```bash
 # 将 ONNX 模型转换为 NPU 二进制
-python onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --output model.npu1.bin
+python3 onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --input sample.bin --output model.npu1.bin
 
-# 内部（发布时去掉）
-python3 internal/phase1_regression.py
-python3 internal/tests/synth_dw_e2e.py
+# 运行内置打包器与 CSIM 参考自检
+python3 model_packer.py test
 ```
 
 ## 依赖
