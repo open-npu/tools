@@ -25,8 +25,9 @@
 # 将 ONNX 模型转换为 NPU 二进制
 python3 onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --input sample.bin --output model.npu1.bin
 
-# 分析模型算力利用率 (SOL%)、Roofline、片上四库 SRAM 占用与优化空间
-python3 npu_profiler.py --model model.npu1.bin --dma-bus-width 128
+# 分析模型算力利用率 (SOL%)、Roofline、片上四库 SRAM 占用并导出可视化图表 (PNG / 交互式 HTML)
+python3 npu_profiler.py --model model.npu1.bin --dma-bus-width 128 \
+    --png-out profile.png --html-out profile.html
 
 # 结合 RTL/SoC 硬件 PMU 仿真日志做周期级停顿归因分析
 python3 npu_profiler.py --meta path/to/metadata.json --soc-log sim.log --dma-bus-width 128

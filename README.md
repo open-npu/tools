@@ -23,8 +23,9 @@ Python toolchain for converting, quantizing, and packing neural network models f
 # Convert ONNX model to NPU binary
 python3 onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --input sample.bin --output model.npu1.bin
 
-# Profile compute SOL%, Roofline, 4-bank SRAM occupancy & optimization hints
-python3 npu_profiler.py --model model.npu1.bin --dma-bus-width 128
+# Profile compute SOL%, Roofline, 4-bank SRAM occupancy & export visual charts
+python3 npu_profiler.py --model model.npu1.bin --dma-bus-width 128 \
+    --png-out profile.png --html-out profile.html
 
 # Combine static model profile with RTL/SoC hardware PMU trace log
 python3 npu_profiler.py --meta path/to/metadata.json --soc-log sim.log --dma-bus-width 128

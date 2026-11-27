@@ -1158,6 +1158,552 @@ def print_report(
 
 
 # ─────────────────────────────────────────────────────────────────────
+#  Visual Dashboard Renderers (PNG Poster + Interactive HTML)
+# ─────────────────────────────────────────────────────────────────────
+
+def _load_fonts():
+    from PIL import ImageFont
+    bold_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    reg_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    mono_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ]
+
+    def pick(paths, size):
+        for p in paths:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, size)
+        return ImageFont.load_default()
+
+    return {
+        "h1": pick(bold_paths, 30),
+        "h2": pick(bold_paths, 20),
+        "h3": pick(bold_paths, 16),
+        "kpi": pick(bold_paths, 28),
+        "body": pick(reg_paths, 15),
+        "small": pick(reg_paths, 13),
+        "mono": pick(mono_paths, 13),
+        "tiny": pick(reg_paths, 11),
+    }
+
+
+def render_png_dashboard(
+    out_path: str,
+    model_label: str,
+    layers: List[LayerDesc],
+    profiles: List[LayerProfile],
+    hw: HWConfig,
+    freq_mhz: float,
+    soc_log: Optional[SoCLogSummary] = None,
+) -> bool:
+    """Render an NVIDIA Nsight-style 2200x1560 dark-theme PNG dashboard."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        print("WARNING: Pillow (PIL) not installed; skipping PNG generation.", file=sys.stderr)
+        return False
+
+    W, H = 2200, 1560
+    BG = (13, 17, 23)
+    CARD = (22, 27, 34)
+    BORDER = (48, 54, 61)
+    TXT = (230, 237, 243)
+    MUTED = (139, 148, 158)
+    NV_GREEN = (118, 185, 0)
+    CYAN = (56, 189, 248)
+    AMBER = (245, 158, 11)
+    CORAL = (251, 113, 133)
+    VIOLET = (167, 139, 250)
+    TEAL = (45, 212, 191)
+
+    img = Image.new("RGB", (W, H), BG)
+    drw = ImageDraw.Draw(img)
+    fnt = _load_fonts()
+
+    has_hw = any(p.hw_cycles is not None for p in profiles)
+    cyc_fn = lambda p: (p.hw_cycles if p.hw_cycles is not None else p.est_cycles)
+    total_cycles = max(1, sum(cyc_fn(p) for p in profiles))
+    total_macs = sum(p.macs for p in profiles)
+    total_ext = sum(p.total_ext_bytes for p in profiles)
+    total_raw = sum(p.raw_in_bytes + p.raw_wgt_bytes + p.raw_out_bytes + p.raw_param_bytes for p in profiles)
+    total_halo = sum(p.halo_extra_bytes for p in profiles)
+    total_wrel = sum(p.wgt_reload_extra_bytes for p in profiles)
+    total_fsav = sum(p.fusion_saved_bytes for p in profiles)
+
+    peak_gmacs = (hw.mac_lanes * freq_mhz) / 1000.0
+    peak_bw = (hw.ext_bw_bytes * freq_mhz) / 1000.0
+    ach_gmacs = (total_macs / total_cycles) * (freq_mhz / 1000.0)
+    lat_ms = total_cycles / (freq_mhz * 1000.0)
+    fps = 1000.0 / lat_ms if lat_ms > 0 else 0.0
+    dense_sol = min(100.0, ((total_macs / hw.mac_lanes) / total_cycles) * 100.0)
+    arch_sol = min(100.0, (sum(p.ideal_comp_cycles for p in profiles) / total_cycles) * 100.0)
+    bw_sol = min(100.0, ((total_ext / hw.ext_bw_bytes) / total_cycles) * 100.0)
+
+    def card(x0, y0, x1, y1, title):
+        drw.rounded_rectangle([x0, y0, x1, y1], radius=12, fill=CARD, outline=BORDER, width=2)
+        drw.rectangle([x0 + 16, y0 + 16, x0 + 22, y0 + 38], fill=NV_GREEN)
+        drw.text((x0 + 32, y0 + 15), title, font=fnt["h2"], fill=TXT)
+
+    # ── Top Header Banner ──
+    drw.rounded_rectangle([24, 20, W - 24, 132], radius=12, fill=(18, 24, 32), outline=BORDER, width=2)
+    drw.rectangle([24, 20, 34, 132], fill=NV_GREEN)
+    mode_tag = "RTL/SoC Hardware PMU + Roofline" if has_hw else "Offline Analytical + Roofline"
+    drw.text((52, 34), f"OPEN-NPU NSIGHT PROFILER  —  {model_label}", font=fnt["h1"], fill=TXT)
+    drw.text(
+        (52, 76),
+        f"Mode: {mode_tag}   |   HW: {hw.mac_lanes} Dense MACs, {hw.dw_parallel_ch} DW, {PPU_LANES} PPU   |   "
+        f"SRAM: {hw.spad_total_kb} KB (32/48/80/12 KB)   |   Bus: {hw.dma_bus_width}-bit {hw.dma_bus_proto.upper()} @ {freq_mhz:.0f} MHz",
+        font=fnt["body"], fill=MUTED,
+    )
+
+    kpis = [
+        ("LATENCY / FPS", f"{lat_ms:.2f} ms  ({fps:.1f} FPS)", NV_GREEN),
+        ("THROUGHPUT", f"{ach_gmacs:.2f} / {peak_gmacs:.1f} GMAC/s", CYAN),
+        ("DENSE / ARCH SOL", f"{dense_sol:.1f}%  /  {arch_sol:.1f}%", AMBER),
+        ("EXT DDR TRAFFIC", f"{_fmt_bytes(total_ext)}  ({total_macs / 1e6:.0f}M MAC)", VIOLET),
+    ]
+    kx = W - 1060
+    for lbl, val, col in kpis:
+        drw.rounded_rectangle([kx, 32, kx + 248, 120], radius=8, fill=(13, 17, 23), outline=BORDER, width=1)
+        drw.text((kx + 14, 42), lbl, font=fnt["tiny"], fill=MUTED)
+        drw.text((kx + 14, 68), val, font=fnt["h3"], fill=col)
+        kx += 260
+
+    # ── Panel 1: Speed-of-Light & Bus Width Scaling (Left Top) ──
+    p1 = (24, 152, 1088, 590)
+    card(*p1, "1. SPEED-OF-LIGHT (SOL%) & DMA BUS SCALING")
+    pmu_layers = [p.pmu for p in profiles if p.pmu and p.pmu.npu_cycles > 0]
+    ovlp_pct = 0.0
+    if pmu_layers and sum(m.dma_cycles for m in pmu_layers) > 0:
+        ovlp_pct = 100.0 * sum(m.ovlp_cycles for m in pmu_layers) / sum(m.dma_cycles for m in pmu_layers)
+    else:
+        ovlp_pct = 100.0 * sum(1 for p in profiles if p.db_en) / max(1, len(profiles))
+
+    gauges = [
+        ("Arch-Adjusted Compute SOL (64-MAC + 8-DW + 8-Vec)", arch_sol, NV_GREEN),
+        ("Absolute 64-Lane Dense MAC Utilization", dense_sol, CYAN),
+        ("External Memory Bandwidth SOL", bw_sol, AMBER),
+        ("DMA / Compute Overlap Efficiency" if pmu_layers else "Double-Buffer Layer Coverage", ovlp_pct, TEAL),
+    ]
+    gy = p1[1] + 62
+    for glbl, gval, gcol in gauges:
+        drw.text((p1[0] + 28, gy), glbl, font=fnt["body"], fill=TXT)
+        drw.text((p1[2] - 100, gy), f"{gval:5.1f}%", font=fnt["h3"], fill=gcol)
+        bx0, by0, bx1, by1 = p1[0] + 28, gy + 24, p1[2] - 28, gy + 42
+        drw.rounded_rectangle([bx0, by0, bx1, by1], radius=6, fill=(33, 38, 45))
+        fill_w = int((bx1 - bx0) * max(0.0, min(100.0, gval)) / 100.0)
+        if fill_w > 4:
+            drw.rounded_rectangle([bx0, by0, bx0 + fill_w, by1], radius=6, fill=gcol)
+        gy += 58
+
+    # Bus scaling sub-chart
+    drw.text((p1[0] + 28, gy + 8), "Analytical External Bus Scaling (Cycles & Speedup):", font=fnt["h3"], fill=TXT)
+    w_est = {}
+    for bits in (32, 64, 128):
+        bw = bits // 8
+        c_sum = 0
+        for p in profiles:
+            d_cyc = math.ceil(p.total_ext_bytes / bw)
+            c_sum += (max(p.ideal_comp_cycles, d_cyc) + math.ceil(0.15 * min(p.ideal_comp_cycles, d_cyc))) if (p.db_en and p.tiled) else (p.ideal_comp_cycles + d_cyc)
+        w_est[bits] = max(1, c_sum)
+    max_w = w_est[32]
+    by = gy + 38
+    for bits, bcol in [(32, CORAL), (64, AMBER), (128, NV_GREEN)]:
+        drw.text((p1[0] + 28, by + 3), f"{bits:>3}-bit DMA", font=fnt["mono"], fill=TXT)
+        bx0, bx1 = p1[0] + 150, p1[2] - 250
+        bw_px = int((bx1 - bx0) * (w_est[bits] / max_w))
+        drw.rounded_rectangle([bx0, by, bx1, by + 22], radius=5, fill=(33, 38, 45))
+        drw.rounded_rectangle([bx0, by, bx0 + max(8, bw_px), by + 22], radius=5, fill=bcol)
+        sp = max_w / w_est[bits]
+        drw.text((bx1 + 14, by + 2), f"{w_est[bits]:>11,} cyc  ({sp:.2f}x)", font=fnt["mono"], fill=bcol)
+        by += 32
+
+    # ── Panel 2: Log-Log Roofline Model (Right Top) ──
+    p2 = (1112, 152, W - 24, 590)
+    card(*p2, f"2. ROOFLINE MODEL (GMAC/s vs MAC/Byte @ {freq_mhz:.0f} MHz)")
+    rx0, ry0, rx1, ry1 = p2[0] + 82, p2[1] + 64, p2[2] - 36, p2[3] - 54
+    drw.rectangle([rx0, ry0, rx1, ry1], fill=(15, 20, 27), outline=BORDER, width=1)
+
+    # Log10 axes: X in [0.1, 250] MAC/Byte -> log10 [-1.0, 2.4]; Y in [0.05, 20] GMAC/s -> log10 [-1.3, 1.3]
+    lx_min, lx_max = -1.0, 2.4
+    ly_min, ly_max = -1.3, 1.35
+
+    def map_rf(ai_val, gmac_val):
+        lx = max(lx_min, min(lx_max, math.log10(max(1e-3, ai_val))))
+        ly = max(ly_min, min(ly_max, math.log10(max(1e-3, gmac_val))))
+        px = rx0 + int((lx - lx_min) / (lx_max - lx_min) * (rx1 - rx0))
+        py = ry1 - int((ly - ly_min) / (ly_max - ly_min) * (ry1 - ry0))
+        return px, py
+
+    # Grid lines
+    for xv in [0.1, 0.5, 1, 2, 4, 10, 25, 100]:
+        gx, _ = map_rf(xv, 1.0)
+        drw.line([gx, ry0, gx, ry1], fill=(30, 36, 44), width=1)
+        drw.text((gx - 14, ry1 + 8), f"{xv:g}", font=fnt["tiny"], fill=MUTED)
+    drw.text(((rx0 + rx1) // 2 - 90, ry1 + 26), "Arithmetic Intensity (MAC / Byte)", font=fnt["small"], fill=MUTED)
+
+    for yv in [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.8]:
+        _, gy_p = map_rf(1.0, yv)
+        drw.line([rx0, gy_p, rx1, gy_p], fill=(30, 36, 44), width=1)
+        drw.text((rx0 - 52, gy_p - 7), f"{yv:g}", font=fnt["tiny"], fill=MUTED)
+
+    # Draw Roofs: 32b (0.8 GB/s), 64b (1.6 GB/s), 128b (3.2 GB/s) + Dense peak + DW peak
+    dw_peak = (hw.dw_parallel_ch * freq_mhz) / 1000.0
+    _, y_dw = map_rf(1.0, dw_peak)
+    drw.line([rx0, y_dw, rx1, y_dw], fill=(120, 100, 50), width=2)
+    drw.text((rx1 - 190, y_dw + 4), f"8-DW Roof ({dw_peak:.1f} GMAC/s)", font=fnt["tiny"], fill=AMBER)
+
+    for bw_b, rcol, rlbl in [(4, CORAL, "32b"), (8, AMBER, "64b"), (16, NV_GREEN, "128b")]:
+        bw_gbs = (bw_b * freq_mhz) / 1000.0
+        ridge = peak_gmacs / bw_gbs
+        p_start = map_rf(0.1, 0.1 * bw_gbs)
+        p_knee = map_rf(ridge, peak_gmacs)
+        p_end = map_rf(250.0, peak_gmacs)
+        w_line = 3 if bw_b == hw.ext_bw_bytes else 1
+        drw.line([p_start, p_knee, p_end], fill=rcol, width=w_line)
+        lx_lbl, ly_lbl = map_rf(ridge * 0.48, ridge * 0.48 * bw_gbs)
+        drw.text((lx_lbl - 28, ly_lbl - 16), f"{rlbl} ({bw_gbs:.1f}GB/s)", font=fnt["tiny"], fill=rcol)
+
+    # Plot layer bubbles
+    fam_colors = {
+        "Conv1x1": CYAN,
+        "DW3x3": AMBER,
+        "GlobalDW": AMBER,
+        "FC": VIOLET,
+    }
+    top_cyc_ids = {p.idx for p in sorted(profiles, key=cyc_fn, reverse=True)[:6]}
+    for p in profiles:
+        c = cyc_fn(p)
+        if p.macs <= 0 or c <= 0:
+            continue
+        ai_v = p.macs / max(1, p.total_ext_bytes)
+        gm_v = (p.macs / c) * (freq_mhz / 1000.0)
+        px, py = map_rf(ai_v, gm_v)
+        rad = max(5, min(16, int(4 + 28 * math.sqrt(c / total_cycles))))
+        bcol = fam_colors.get(p.op_family, NV_GREEN)
+        drw.ellipse([px - rad, py - rad, px + rad, py + rad], fill=bcol, outline=TXT, width=1)
+        if p.idx in top_cyc_ids:
+            drw.text((px + rad + 4, py - 7), f"L{p.idx}", font=fnt["tiny"], fill=TXT)
+
+    # Legend inside Roofline
+    leg_x = rx0 + 14
+    for l_txt, l_col in [("Conv3x3/7x7", NV_GREEN), ("Conv1x1", CYAN), ("DWConv", AMBER), ("FC", VIOLET)]:
+        drw.ellipse([leg_x, ry0 + 10, leg_x + 10, ry0 + 20], fill=l_col)
+        drw.text((leg_x + 15, ry0 + 8), l_txt, font=fnt["tiny"], fill=TXT)
+        leg_x += 108
+
+    # ── Panel 3: 4-Bank On-Chip SRAM ("Cache") & Traffic Waterfall (Middle Left) ──
+    p3 = (24, 610, 1088, 1030)
+    card(*p3, "3. 4-BANK ON-CHIP SRAM ('CACHE') OCCUPANCY & DDR AMPLIFICATION")
+    sy = p3[1] + 62
+    banks = [
+        ("IFM Bank (32 KB)", hw.act_bank_size, lambda p: p.ifm_used_bytes, lambda p: p.ifm_occ_pct, CYAN),
+        ("OFM Bank (48 KB)", hw.ofm_bank_size, lambda p: p.ofm_used_bytes, lambda p: p.ofm_occ_pct, NV_GREEN),
+        ("WGT Bank (80 KB)", hw.weight_buf_size, lambda p: p.wgt_used_bytes, lambda p: p.wgt_occ_pct, AMBER),
+        ("PRM Bank (12 KB)", hw.param_sram_size, lambda p: p.prm_used_bytes, lambda p: p.prm_occ_pct, VIOLET),
+    ]
+    for bname, bcap, ufn, ofn, bcol in banks:
+        act = [p for p in profiles if ufn(p) > 0]
+        pk_pct = min(100.0, 100.0 * max((ufn(p) for p in act), default=0) / bcap)
+        av_pct = (sum(ofn(p) for p in act) / len(act)) if act else 0.0
+        drw.text((p3[0] + 28, sy), bname, font=fnt["body"], fill=TXT)
+        bx0, bx1 = p3[0] + 215, p3[2] - 255
+        drw.rounded_rectangle([bx0, sy + 2, bx1, sy + 22], radius=5, fill=(33, 38, 45))
+        pk_w = int((bx1 - bx0) * pk_pct / 100.0)
+        av_w = int((bx1 - bx0) * av_pct / 100.0)
+        if pk_w > 4:
+            drw.rounded_rectangle([bx0, sy + 2, bx0 + pk_w, sy + 22], radius=5, fill=(55, 65, 81))
+        if av_w > 4:
+            drw.rounded_rectangle([bx0, sy + 2, bx0 + av_w, sy + 22], radius=5, fill=bcol)
+        drw.text((bx1 + 14, sy + 2), f"Avg {av_pct:4.1f}% | Peak {pk_pct:5.1f}%", font=fnt["mono"], fill=bcol)
+        sy += 44
+
+    # DDR Amplification Bridge
+    drw.line([p3[0] + 24, sy + 8, p3[2] - 24, sy + 8], fill=BORDER, width=1)
+    drw.text((p3[0] + 28, sy + 20), "DDR Traffic Accounting (Raw vs Cache Amplification vs Fusion Savings):", font=fnt["h3"], fill=TXT)
+    bridge = [
+        ("Raw Tensors", _fmt_bytes(total_raw), CYAN),
+        ("+ Tile Halo", f"+{_fmt_bytes(total_halo)}", AMBER),
+        ("+ WGT Reload", f"+{_fmt_bytes(total_wrel)}", CORAL),
+        ("- SRAM Fusion", f"-{_fmt_bytes(total_fsav)}", NV_GREEN),
+        ("= Net Ext DDR", _fmt_bytes(total_ext), TXT),
+    ]
+    bx = p3[0] + 28
+    for b_lbl, b_val, b_col in bridge:
+        drw.rounded_rectangle([bx, sy + 52, bx + 192, sy + 118], radius=8, fill=(15, 20, 27), outline=BORDER, width=1)
+        drw.text((bx + 12, sy + 60), b_lbl, font=fnt["tiny"], fill=MUTED)
+        drw.text((bx + 12, sy + 84), b_val, font=fnt["h3"], fill=b_col)
+        bx += 202
+
+    # ── Panel 4: Pipeline State / Operator Breakdown (Middle Right) ──
+    p4 = (1112, 610, W - 24, 1030)
+    if pmu_layers:
+        card(*p4, "4. RTL HARDWARE PMU PIPELINE & STALL ATTRIBUTION")
+        tot_npu = max(1, sum(m.npu_cycles for m in pmu_layers))
+        items = [
+            ("ST_MAC   (64-Lane Row MAC Active)", sum(m.st_mac for m in pmu_layers), NV_GREEN),
+            ("ST_WB    (8-Lane PPU Drain/Requant)", sum(m.st_wb for m in pmu_layers), CYAN),
+            ("WT_WGT   (Stall Waiting on WGT DMA)", sum(m.wt_wgt for m in pmu_layers), CORAL),
+            ("WT_DB    (Double-Buffer Sync Wait)", sum(m.wt_db for m in pmu_layers), AMBER),
+            ("WT_ACT   (Stall Waiting on IFM DMA)", sum(m.wt_act for m in pmu_layers), VIOLET),
+            ("ST_VEC   (Pooling / Add / Resize)", sum(m.st_pool + m.st_add + m.st_rsz for m in pmu_layers), TEAL),
+            ("WT_STORE (Stall Waiting on OFM DMA)", sum(m.wt_store for m in pmu_layers), (244, 114, 182)),
+        ]
+        denom = tot_npu
+    else:
+        card(*p4, "4. OPERATOR FAMILY CYCLE & COMPUTE BREAKDOWN")
+        fam_agg: Dict[str, int] = {}
+        for p in profiles:
+            fam_agg[p.op_family] = fam_agg.get(p.op_family, 0) + cyc_fn(p)
+        palette = [NV_GREEN, CYAN, AMBER, VIOLET, TEAL, CORAL, (244, 114, 182)]
+        items = [
+            (f"{fam:<12} ({sum(1 for x in profiles if x.op_family == fam):>2} layers)", cyc_v, palette[idx % len(palette)])
+            for idx, (fam, cyc_v) in enumerate(sorted(fam_agg.items(), key=lambda kv: kv[1], reverse=True)[:7])
+        ]
+        denom = total_cycles
+
+    # Stacked horizontal bar at top of Panel 4
+    sx0, sx1 = p4[0] + 28, p4[2] - 28
+    sy0 = p4[1] + 62
+    drw.rounded_rectangle([sx0, sy0, sx1, sy0 + 28], radius=6, fill=(33, 38, 45))
+    cur_x = sx0
+    for _, iv, icol in items:
+        w_seg = int((sx1 - sx0) * (iv / denom))
+        if w_seg > 2:
+            drw.rectangle([cur_x, sy0, min(sx1, cur_x + w_seg), sy0 + 28], fill=icol)
+            cur_x += w_seg
+
+    iy = sy0 + 48
+    for ilbl, iv, icol in items:
+        pct = 100.0 * iv / denom
+        drw.rectangle([sx0, iy + 4, sx0 + 14, iy + 18], fill=icol)
+        drw.text((sx0 + 24, iy), ilbl, font=fnt["mono"], fill=TXT)
+        bx0, bx1 = sx0 + 365, sx1 - 210
+        drw.rounded_rectangle([bx0, iy + 3, bx1, iy + 19], radius=4, fill=(33, 38, 45))
+        bw_i = int((bx1 - bx0) * min(1.0, pct / 100.0))
+        if bw_i > 3:
+            drw.rounded_rectangle([bx0, iy + 3, bx0 + bw_i, iy + 19], radius=4, fill=icol)
+        drw.text((bx1 + 12, iy), f"{iv:>10,} cyc ({pct:4.1f}%)", font=fnt["mono"], fill=icol)
+        iy += 42
+
+    # ── Panel 5: Per-Layer Cycle Waterfall + Optimization Advisor (Bottom) ──
+    p5_l = (24, 1050, 1340, H - 24)
+    card(*p5_l, f"5. PER-LAYER CYCLE WATERFALL ({len(profiles)} LAYERS, COLOR = BOTTLENECK REGIME)")
+    wx0, wy0, wx1, wy1 = p5_l[0] + 68, p5_l[1] + 66, p5_l[2] - 28, p5_l[3] - 52
+    drw.rectangle([wx0, wy0, wx1, wy1], fill=(15, 20, 27), outline=BORDER, width=1)
+
+    max_l_cyc = max((cyc_fn(p) for p in profiles), default=1)
+    n_l = max(1, len(profiles))
+    slot_w = (wx1 - wx0) / n_l
+    bar_w = max(3.0, slot_w * 0.76)
+
+    for idx_l, p in enumerate(profiles):
+        c = cyc_fn(p)
+        bh = int((wy1 - wy0 - 18) * (c / max(1, max_l_cyc)))
+        bx_l = int(wx0 + idx_l * slot_w + (slot_w - bar_w) * 0.5)
+        bx_r = max(bx_l + 2, int(bx_l + bar_w))
+        if "BW-BOUND" in p.bound_regime:
+            bcol = CORAL
+        elif "PPU/WB" in p.bound_regime:
+            bcol = CYAN
+        elif "DW-" in p.bound_regime:
+            bcol = AMBER
+        elif "FUSED" in p.bound_regime:
+            bcol = TEAL
+        else:
+            bcol = NV_GREEN
+        if bh > 1:
+            drw.rectangle([bx_l, wy1 - bh, bx_r, wy1 - 1], fill=bcol)
+        step = max(1, n_l // 16)
+        if idx_l % step == 0:
+            drw.text((bx_l - 4, wy1 + 6), f"L{p.idx}", font=fnt["tiny"], fill=MUTED)
+
+    # Annotate top 4 tallest bars
+    for p in sorted(profiles, key=cyc_fn, reverse=True)[:4]:
+        c = cyc_fn(p)
+        bh = int((wy1 - wy0 - 18) * (c / max(1, max_l_cyc)))
+        bx_c = int(wx0 + p.idx * slot_w)
+        drw.text((max(wx0 + 4, min(wx1 - 95, bx_c - 10)), max(wy0 + 4, wy1 - bh - 16)),
+                 f"L{p.idx}:{p.op_family}", font=fnt["tiny"], fill=TXT)
+
+    # Regime legend
+    rlx = wx0 + 12
+    for rtxt, rcol in [("Compute-Bound", NV_GREEN), ("PPU/WB-Heavy", CYAN), ("DW-8Lane", AMBER), ("BW-Bound", CORAL), ("SRAM-Fused", TEAL)]:
+        drw.rectangle([rlx, wy0 + 8, rlx + 12, wy0 + 20], fill=rcol)
+        drw.text((rlx + 17, wy0 + 6), rtxt, font=fnt["tiny"], fill=TXT)
+        rlx += 150
+
+    # Panel 6: Optimization Advisor (Bottom Right)
+    p6 = (1364, 1050, W - 24, H - 24)
+    card(*p6, "6. OPTIMIZATION ADVISOR (RANKED SAVINGS)")
+    findings = generate_optimization_findings(layers, profiles, hw)[:4]
+    fy = p6[1] + 58
+    if not findings:
+        drw.text((p6[0] + 28, fy + 20), "Near architectural roofline — no major bottlenecks.", font=fnt["body"], fill=NV_GREEN)
+    else:
+        for f in findings:
+            pct = 100.0 * f.est_cycle_saving / total_cycles
+            scol = CORAL if f.severity == "HIGH" else (AMBER if f.severity == "MEDIUM" else CYAN)
+            drw.rounded_rectangle([p6[0] + 20, fy, p6[2] - 20, fy + 94], radius=8, fill=(15, 20, 27), outline=BORDER, width=1)
+            drw.rectangle([p6[0] + 20, fy, p6[0] + 26, fy + 94], fill=scol)
+            title_short = f.title if len(f.title) <= 64 else f.title[:61] + "..."
+            drw.text((p6[0] + 36, fy + 8), f"[{f.category}] {title_short}", font=fnt["h3"], fill=scol)
+            drw.text((p6[0] + 36, fy + 34), f"Est. Upper-Bound Saving: ~{f.est_cycle_saving:,} cycles (~{pct:.1f}%)", font=fnt["mono"], fill=NV_GREEN)
+            det_short = f.detail if len(f.detail) <= 92 else f.detail[:89] + "..."
+            drw.text((p6[0] + 36, fy + 58), det_short, font=fnt["tiny"], fill=MUTED)
+            fy += 104
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    img.save(out_path, format="PNG", optimize=True)
+    print(f"Exported PNG visual profile to {out_path}")
+    return True
+
+
+def render_html_dashboard(
+    out_path: str,
+    model_label: str,
+    layers: List[LayerDesc],
+    profiles: List[LayerProfile],
+    hw: HWConfig,
+    freq_mhz: float,
+    soc_log: Optional[SoCLogSummary] = None,
+) -> None:
+    """Export a zero-dependency interactive HTML dashboard (hover Roofline + full layer table)."""
+    import html as _html
+
+    has_hw = any(p.hw_cycles is not None for p in profiles)
+    cyc_fn = lambda p: (p.hw_cycles if p.hw_cycles is not None else p.est_cycles)
+    total_cycles = max(1, sum(cyc_fn(p) for p in profiles))
+    total_macs = sum(p.macs for p in profiles)
+    total_ext = sum(p.total_ext_bytes for p in profiles)
+    peak_gmacs = (hw.mac_lanes * freq_mhz) / 1000.0
+    ach_gmacs = (total_macs / total_cycles) * (freq_mhz / 1000.0)
+    lat_ms = total_cycles / (freq_mhz * 1000.0)
+    dense_sol = min(100.0, ((total_macs / hw.mac_lanes) / total_cycles) * 100.0)
+    arch_sol = min(100.0, (sum(p.ideal_comp_cycles for p in profiles) / total_cycles) * 100.0)
+    findings = generate_optimization_findings(layers, profiles, hw)
+
+    rows_html = []
+    pts_js = []
+    for p in profiles:
+        c = cyc_fn(p)
+        dsol = ((p.macs / hw.mac_lanes) / c) * 100.0 if (p.macs > 0 and c > 0) else 0.0
+        gmacs_l = (p.macs / c) * (freq_mhz / 1000.0) if c > 0 else 0.0
+        ai_l = p.macs / max(1, p.total_ext_bytes)
+        if p.macs > 0 and c > 0:
+            pts_js.append({
+                "idx": p.idx, "op": p.op_family, "shape": p.shape_str,
+                "ai": round(ai_l, 2), "gmacs": round(gmacs_l, 2),
+                "cyc": c, "pct": round(100.0 * c / total_cycles, 2),
+                "regime": p.bound_regime,
+            })
+        rows_html.append(
+            f"<tr><td>L{p.idx}</td><td>{_html.escape(p.op_family)}</td>"
+            f"<td>{_html.escape(p.shape_str)}</td><td class='num'>{c:,}</td>"
+            f"<td class='num'>{100.0 * c / total_cycles:.1f}%</td>"
+            f"<td class='num'>{dsol:.1f}%</td>"
+            f"<td class='num'>{_fmt_bytes(p.total_ext_bytes)}</td>"
+            f"<td class='num'>{p.ifm_occ_pct:.0f}% / {p.ofm_occ_pct:.0f}% / {p.wgt_occ_pct:.0f}%</td>"
+            f"<td class='num'>{p.num_tiles}</td>"
+            f"<td>{_html.escape(p.fuse_tag)}</td>"
+            f"<td><span class='tag'>{_html.escape(p.bound_regime)}</span></td></tr>"
+        )
+
+    adv_html = "".join(
+        f"<div class='adv'><b>[{_html.escape(f.severity)}] [{_html.escape(f.category)}] {_html.escape(f.title)}</b>"
+        f"<div class='sav'>Est. Upper-Bound Saving: ~{f.est_cycle_saving:,} cycles (~{100.0 * f.est_cycle_saving / total_cycles:.1f}%)</div>"
+        f"<p>{_html.escape(f.detail)}</p></div>"
+        for f in findings
+    ) or "<div class='adv'>Near architectural roofline.</div>"
+
+    doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Open-NPU Profile — {_html.escape(model_label)}</title>
+<style>
+  body {{ background:#0d1117; color:#e6edf3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:24px; }}
+  h1 {{ margin:0 0 6px 0; font-size:24px; color:#76b900; }}
+  .sub {{ color:#8b949e; font-size:13px; margin-bottom:18px; }}
+  .kpis {{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:18px; }}
+  .kpi {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 16px; }}
+  .kpi .k {{ color:#8b949e; font-size:11px; text-transform:uppercase; }}
+  .kpi .v {{ font-size:20px; font-weight:700; margin-top:4px; color:#58a6ff; }}
+  .grid2 {{ display:grid; grid-template-columns:1.2fr 1fr; gap:16px; margin-bottom:18px; }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:16px; }}
+  .card h2 {{ margin:0 0 12px 0; font-size:15px; color:#e6edf3; border-left:4px solid #76b900; padding-left:10px; }}
+  .adv {{ background:#0d1117; border:1px solid #30363d; border-left:4px solid #f59e0b; border-radius:6px; padding:10px 12px; margin-bottom:10px; font-size:13px; }}
+  .adv .sav {{ color:#76b900; font-family:monospace; margin:4px 0; }}
+  .adv p {{ margin:4px 0 0 0; color:#8b949e; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+  th, td {{ border-bottom:1px solid #21262d; padding:7px 8px; text-align:left; }}
+  th {{ background:#0d1117; color:#8b949e; position:sticky; top:0; }}
+  td.num {{ text-align:right; font-family:monospace; }}
+  .tag {{ background:#21262d; padding:2px 6px; border-radius:4px; font-size:11px; }}
+  #tip {{ position:fixed; display:none; background:#1f2937; border:1px solid #76b900; padding:8px 10px; border-radius:6px; font-size:12px; pointer-events:none; z-index:99; }}
+</style></head><body>
+<h1>Open-NPU Nsight-Style Interactive Profiler — {_html.escape(model_label)}</h1>
+<div class="sub">HW: {hw.mac_lanes} Dense MACs | {hw.dw_parallel_ch} DW | {PPU_LANES} PPU | {hw.spad_total_kb} KB 4-Bank SRAM | {hw.dma_bus_width}-bit {hw.dma_bus_proto.upper()} @ {freq_mhz:.0f} MHz | Mode: {'RTL HW PMU' if has_hw else 'Analytical Roofline'}</div>
+<div class="kpis">
+  <div class="kpi"><div class="k">Active Cycles</div><div class="v">{total_cycles:,}</div></div>
+  <div class="kpi"><div class="k">Latency / FPS</div><div class="v" style="color:#76b900">{lat_ms:.2f} ms ({1000.0 / max(1e-6, lat_ms):.1f} FPS)</div></div>
+  <div class="kpi"><div class="k">Throughput</div><div class="v">{ach_gmacs:.2f} / {peak_gmacs:.1f} GMAC/s</div></div>
+  <div class="kpi"><div class="k">Dense / Arch SOL%</div><div class="v" style="color:#f59e0b">{dense_sol:.1f}% / {arch_sol:.1f}%</div></div>
+  <div class="kpi"><div class="k">Ext DDR Traffic</div><div class="v" style="color:#a78bfa">{_fmt_bytes(total_ext)}</div></div>
+</div>
+<div class="grid2">
+  <div class="card"><h2>Interactive Log-Log Roofline (Hover Bubbles for Layer Details)</h2>
+    <svg id="rf" viewBox="0 0 760 360" style="width:100%;height:auto;background:#0d1117;border-radius:6px;"></svg>
+  </div>
+  <div class="card"><h2>Actionable Optimization Advisor</h2>{adv_html}</div>
+</div>
+<div class="card"><h2>Per-Layer Breakdown ({len(profiles)} Layers — SRAM Occupancy = IFM / OFM / WGT)</h2>
+  <div style="max-height:520px;overflow:auto;">
+    <table><thead><tr><th>ID</th><th>Op</th><th>Shape</th><th>Cycles</th><th>Cyc%</th><th>Dense%</th><th>DDR</th><th>SRAM Occ%</th><th>Tiles</th><th>Fuse</th><th>Regime</th></tr></thead>
+    <tbody>{''.join(rows_html)}</tbody></table>
+  </div>
+</div>
+<div id="tip"></div>
+<script>
+const pts = {json.dumps(pts_js)};
+const peak = {peak_gmacs}, freq = {freq_mhz};
+const svg = document.getElementById('rf'), tip = document.getElementById('tip');
+const x0=58, y0=22, x1=735, y1=322, lxMin=-1.0, lxMax=2.4, lyMin=-1.3, lyMax=1.35;
+const mx = ai => x0 + (Math.min(lxMax,Math.max(lxMin,Math.log10(Math.max(1e-3,ai))))-lxMin)/(lxMax-lxMin)*(x1-x0);
+const my = gm => y1 - (Math.min(lyMax,Math.max(lyMin,Math.log10(Math.max(1e-3,gm))))-lyMin)/(lyMax-lyMin)*(y1-y0);
+let h = '';
+[0.1,0.5,1,2,4,10,25,100].forEach(v=>{{ let x=mx(v); h+=`<line x1="${{x}}" y1="${{y0}}" x2="${{x}}" y2="${{y1}}" stroke="#21262d"/><text x="${{x-10}}" y="${{y1+16}}" fill="#8b949e" font-size="10">${{v}}</text>`; }});
+[0.1,0.5,1,2,4,8,12.8].forEach(v=>{{ let y=my(v); h+=`<line x1="${{x0}}" y1="${{y}}" x2="${{x1}}" y2="${{y}}" stroke="#21262d"/><text x="${{x0-42}}" y="${{y+4}}" fill="#8b949e" font-size="10">${{v}}</text>`; }});
+[[4,'#fb7185','32b'],[8,'#f59e0b','64b'],[16,'#76b900','128b']].forEach(([b,c,lbl])=>{{
+  let bw = b*freq/1000, r = peak/bw;
+  h+=`<polyline fill="none" stroke="${{c}}" stroke-width="${{b==={hw.ext_bw_bytes}?2.8:1.3}}" points="${{mx(0.1)}},${{my(0.1*bw)}} ${{mx(r)}},${{my(peak)}} ${{mx(250)}},${{my(peak)}}"/>`;
+}});
+pts.forEach((p,i)=>{{
+  let cx=mx(p.ai), cy=my(p.gmacs), r=Math.max(4,Math.min(14,4+Math.sqrt(p.pct)*3.2));
+  let col = p.op==='Conv1x1'?'#38bdf8':(p.op.startsWith('DW')?'#f59e0b':(p.op==='FC'?'#a78bfa':'#76b900'));
+  h+=`<circle cx="${{cx}}" cy="${{cy}}" r="${{r}}" fill="${{col}}" fill-opacity="0.82" stroke="#e6edf3" stroke-width="1" data-i="${{i}}"/>`;
+}});
+svg.innerHTML = h;
+svg.addEventListener('mousemove', e=>{{
+  const idx = e.target.getAttribute('data-i');
+  if(idx===null){{ tip.style.display='none'; return; }}
+  const p = pts[+idx];
+  tip.style.display='block'; tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY+14)+'px';
+  tip.innerHTML = `<b>L${{p.idx}} (${{p.op}})</b><br>${{p.shape}}<br>Cycles: ${{p.cyc.toLocaleString()}} (${{p.pct}}%)<br>Throughput: ${{p.gmacs}} GMAC/s | AI: ${{p.ai}} MAC/B<br>Regime: ${{p.regime}}`;
+}});
+</script></body></html>"""
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(doc)
+    print(f"Exported interactive HTML profile to {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  Self-Test
 # ─────────────────────────────────────────────────────────────────────
 
@@ -1218,6 +1764,10 @@ def main() -> None:
                         help="Number of top hotspot layers to display (default: 12)")
     parser.add_argument("--json-out", type=str, default=None,
                         help="Optional path to export structured JSON report")
+    parser.add_argument("--png-out", type=str, default=None,
+                        help="Optional path to export Nsight-style multi-panel PNG chart")
+    parser.add_argument("--html-out", type=str, default=None,
+                        help="Optional path to export interactive HTML Roofline & SRAM dashboard")
     add_hw_args(parser)
     args = parser.parse_args()
 
@@ -1237,6 +1787,11 @@ def main() -> None:
 
     profiles = analyze_model(layers, hw, soc_log=soc_log)
     print_report(label, layers, profiles, hw, freq_mhz=args.freq_mhz, top_n=args.top, soc_log=soc_log)
+
+    if args.png_out:
+        render_png_dashboard(args.png_out, label, layers, profiles, hw, freq_mhz=args.freq_mhz, soc_log=soc_log)
+    if args.html_out:
+        render_html_dashboard(args.html_out, label, layers, profiles, hw, freq_mhz=args.freq_mhz, soc_log=soc_log)
 
     if args.json_out:
         findings = generate_optimization_findings(layers, profiles, hw)
