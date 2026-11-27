@@ -627,7 +627,8 @@ def compute_ms(eff_scale):
     return max(1, min(32767, best_m)), best_s
 
 
-def quantize_weight_perchannel(weight, out_axis=0, bits=8):
+def quantize_weight_perchannel(weight, out_axis=0, bits=8,
+                               scale_in=None, scale_out=None, bias=None):
     """Per-channel symmetric weight quantization.
     Returns: weight_q (int8 or int16), scale_w (float per channel)
     """
@@ -637,18 +638,31 @@ def quantize_weight_perchannel(weight, out_axis=0, bits=8):
     scale_w = np.zeros(out_c, dtype=np.float64)
     dtype = np.int8 if bits == 8 else np.int16
     weight_q = np.zeros_like(weight, dtype=dtype)
+    max_safe_bias_q = float(1 << 41)  # 4x headroom inside 44-bit signed accumulator
 
     for c in range(out_c):
         if out_axis == 0:
             w_ch = weight[c]
         else:
             raise ValueError("Unsupported out_axis")
-        max_abs = np.abs(w_ch).max()
+        max_abs = float(np.abs(w_ch).max())
         if max_abs < 1e-10:
             max_abs = 1e-10
-        scale_w[c] = max_abs / qmax
-        w_ch_q = np.round(w_ch / scale_w[c]).astype(np.int32)
+        sw = max_abs / qmax
+        if (bias is not None and scale_in is not None and scale_in > 0.0
+                and abs(float(bias[c])) > 0.0):
+            min_sw_for_bias = abs(float(bias[c])) / (float(scale_in) * max_safe_bias_q)
+            if sw < min_sw_for_bias:
+                sw = min_sw_for_bias
+        w_ch_q = np.round(w_ch / sw).astype(np.int32)
         w_ch_q = np.clip(w_ch_q, qmin, qmax).astype(dtype)
+        if (np.all(w_ch_q == 0) and scale_in is not None and scale_in > 0.0
+                and scale_out is not None and scale_out > 0.0):
+            # Constant-bias / zero-weight channel: acc is identically 0, so map
+            # scale_in * scale_w == scale_out (eff_scale = 1.0) to avoid S=63
+            # shift underflow and 44-bit bias_q saturation.
+            sw = float(scale_out) / float(scale_in)
+        scale_w[c] = sw
         if out_axis == 0:
             weight_q[c] = w_ch_q
 
@@ -1282,10 +1296,18 @@ def convert_model(model_path, calib_dir, input_path, output_path,
     tensor_quant[input_name] = (in_scale, in_zp)
     print(f"  Input scale={in_scale:.8f}, zp={in_zp}")
 
-    def quantize_w(weight):
+    def quantize_w(weight, scale_in=None, scale_out=None, bias=None):
         if ptq_method in ('admm', 'mse_admm') and bits < 16:
-            return admm_quantize_weight_perchannel(weight, out_axis=0, bits=bits)
-        return quantize_weight_perchannel(weight, out_axis=0, bits=bits)
+            wq, sw = admm_quantize_weight_perchannel(weight, out_axis=0, bits=bits)
+            if (scale_in is not None and scale_in > 0.0
+                    and scale_out is not None and scale_out > 0.0):
+                for c in range(weight.shape[0]):
+                    if np.all(wq[c] == 0):
+                        sw[c] = float(scale_out) / float(scale_in)
+            return wq, sw
+        return quantize_weight_perchannel(
+            weight, out_axis=0, bits=bits,
+            scale_in=scale_in, scale_out=scale_out, bias=bias)
 
     for i, op in enumerate(fused_ops):
         node = op['node']
@@ -1305,15 +1327,15 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 tensor_quant[input_tensor] = (s, z)
             scale_in, zp_in = tensor_quant[input_tensor]
 
-            # Quantize weights per-channel
-            weight = node.weight
-            weight_q, scale_w = quantize_w(weight)
-            bias = node.bias
-
             # Determine output scale from activation ranges
             out_range = get_range(eff_output, is_relu_output=has_act)
             scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
             tensor_quant[eff_output] = (scale_out, zp_out)
+
+            # Quantize weights per-channel (with bias headroom protection)
+            weight = node.weight
+            bias = node.bias
+            weight_q, scale_w = quantize_w(weight, scale_in, scale_out, bias)
 
             # Compute requantize params
             M_arr, S_arr, bias_q_arr = compute_requant_params(
@@ -1642,14 +1664,15 @@ def convert_model(model_path, calib_dir, input_path, output_path,
             if len(node.inputs) > 2 and node.inputs[2] in all_weights:
                 bias = all_weights[node.inputs[2]]
 
-            # Quantize weight per-channel
-            weight_q, scale_w = quantize_w(weight.reshape(out_c, 1, 1, in_c))
-            weight_q = weight_q.reshape(out_c, in_c)
-
             # Output scale
             out_range = get_range(eff_output, is_relu_output=has_act)
             scale_out, zp_out = compute_scale_zp_symmetric(out_range[0], out_range[1], bits)
             tensor_quant[eff_output] = (scale_out, zp_out)
+
+            # Quantize weight per-channel (with bias headroom protection)
+            weight_q, scale_w = quantize_w(
+                weight.reshape(out_c, 1, 1, in_c), scale_in, scale_out, bias)
+            weight_q = weight_q.reshape(out_c, in_c)
 
             # Compute requantize params
             M_arr, S_arr, bias_q_arr = compute_requant_params(
