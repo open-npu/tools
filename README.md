@@ -14,6 +14,7 @@ Python toolchain for converting, quantizing, and packing neural network models f
 | `layer_fusion.py` | Layer fusion (Conv+BN+ReLU, Conv->Pool strip, SRAM chain) |
 | `super_tile.py` | Spatial super-block fusion planner |
 | `hw_config.py` | Parameterizable hardware config (MAC/DW lanes, 4-bank SRAM sizes, `32/64/128-bit` WB/AXI4 DMA bus) |
+| `npu_profiler.py` | Nsight-style Roofline, 4-bank SRAM occupancy, HW PMU stall & optimization profiler |
 | `ptq_mse_admm.py` | MSE clip / ADMM helpers used by the converter |
 
 ## Usage
@@ -21,6 +22,12 @@ Python toolchain for converting, quantizing, and packing neural network models f
 ```bash
 # Convert ONNX model to NPU binary
 python3 onnx_converter.py --model MODEL.onnx --calib CALIB_DIR --input sample.bin --output model.npu1.bin
+
+# Profile compute SOL%, Roofline, 4-bank SRAM occupancy & optimization hints
+python3 npu_profiler.py --model model.npu1.bin --dma-bus-width 128
+
+# Combine static model profile with RTL/SoC hardware PMU trace log
+python3 npu_profiler.py --meta path/to/metadata.json --soc-log sim.log --dma-bus-width 128
 
 # Run built-in packer + CSIM reference self-tests
 python3 model_packer.py test
