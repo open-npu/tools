@@ -1986,10 +1986,7 @@ def convert_model(model_path, calib_dir, input_path, output_path,
                 t_in = ((in_th * in_tw * cfg.in_c * elem_size + 3) // 4) * 4
                 need_in = t_in * (2 if cfg.op_type == OP_ELTWISE_ADD else 1)
                 t_out = th_c * tw_c * cfg.out_c * elem_size
-                w_bytes = (cfg.out_c * cfg.kernel_h * cfg.kernel_w * cfg.in_c * elem_size
-                           if cfg.op_type == OP_CONV2D else 0)
-                if (w_bytes <= profile.weight_buf_size
-                        and need_in <= half_ifm and t_out <= half_ofm):
+                if need_in <= half_ifm and t_out <= half_ofm:
                     cfg.sched_ctrl |= SCHED_CTRL_DB_EN
         if cfg.sched_ctrl & SCHED_CTRL_DB_EN:
             db_count += 1
@@ -2025,7 +2022,8 @@ def convert_model(model_path, calib_dir, input_path, output_path,
               f"{len(strip_marked)} conv-pool strips, "
               f"{len(sram_chains)} untiled SRAM chains ===")
         for (si, th, tw, nh, nw) in super_marked:
-            print(f"    SUPER L{si}-L{si+2}: tile={th}x{tw} ({nh}x{nw} tiles)")
+            end_si = si + 3 if (si + 3 < len(npu_layers) and npu_layers[si + 3].op_type == OP_ELTWISE_ADD and (npu_layers[si + 3].sched_ctrl & SCHED_CTRL_SUPER_BLOCK)) else si + 2
+            print(f"    SUPER L{si}-L{end_si}: tile={th}x{tw} ({nh}x{nw} tiles)")
         for (ci, pi, sc, ph, psh) in strip_marked:
             print(f"    STRIP L{ci}->L{pi}: {sc} strips (prod_h={ph}, pool_h={psh})")
         for ch in sram_chains:

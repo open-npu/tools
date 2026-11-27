@@ -118,14 +118,13 @@ def compute_tiling(op_type, in_h, in_w, in_c, out_h, out_w, out_c,
     full_weight_size = kernel_h * kernel_w * in_c * out_c * elem_size if op_type == 'conv' else 0
 
     # IFM and OFM are separate physical SRAMs. DB_EN halves each independently.
+    # When both full tensors fit on chip, OC groups reload weights in-place
+    # without needing spatial tiling.
     coexist_ok = (full_input_size <= ifm_bank
                   and full_output_size <= ofm_bank)
-    if (coexist_ok and
-        full_weight_size <= weight_buf):
-        # No tiling needed — small layer fits entirely in SRAM
-        # per_tile_store_en=False: single store at layer end (full output)
+    if coexist_ok:
         return {'tile_h': 0, 'tile_w': 0, 'tile_num_h': 0, 'tile_num_w': 0,
-                'tile_oc': out_c, 'per_tile_store_en': False}
+                'tile_oc': tile_oc, 'per_tile_store_en': False}
 
     # Search for optimal output tile size
     # Strategy: maximize tile area while preferring square-ish tiles

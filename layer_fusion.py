@@ -457,24 +457,45 @@ def apply_super_block_fusion(layers, profile: HWConfig = None,
             i += 1
             continue
 
+        # Optional trailing residual Add (4-slot hardware super-block)
+        has_add = False
+        d = None
+        if (i + 3 < n and (i + 2) not in referenced):
+            cand_d = layers[i + 3]
+            d_in_src = int(_lf_get(cand_d, 'input_src', -1))
+            d_res_src = int(_lf_get(cand_d, 'residual_src', -1))
+            if (int(_lf_get(cand_d, 'op_type', -1)) == 4
+                    and int(_lf_get(cand_d, 'data_type', 0)) == 0
+                    and d_in_src in (-1, i + 2)
+                    and 0 <= d_res_src < i
+                    and (_lf_get(cand_d, 'in_h'), _lf_get(cand_d, 'in_w'),
+                         _lf_get(cand_d, 'out_h'), _lf_get(cand_d, 'out_w')) == (h, w, h, w)
+                    and int(_lf_get(cand_d, 'in_c', 0)) == out_c
+                    and int(_lf_get(cand_d, 'out_c', 0)) == out_c):
+                has_add = True
+                d = cand_d
+
         # Skip blocks that fit completely untiled in SRAM (handled with zero halo
         # by apply_untiled_sram_fusion).
         all_untiled = (
             int(_lf_get(a, 'tile_h', 0)) == 0
             and int(_lf_get(b, 'tile_h', 0)) == 0
             and int(_lf_get(c, 'tile_h', 0)) == 0
-            and max(h * w * in_c, h * w * mid_c, h * w * out_c) <= untiled_cap
+            and (not has_add or int(_lf_get(d, 'tile_h', 0)) == 0)
+            and max(h * w * in_c, h * w * mid_c,
+                    (2 if has_add else 1) * h * w * out_c) <= untiled_cap
         )
         if all_untiled:
             i += 1
             continue
 
-        # Resident weight + param SRAM capacity across all 3 slots
+        # Resident weight SRAM capacity across all 3 conv/dw slots; params
+        # either fit all at once or stream per stage when each stage <= cap.
         wgt_words = ((in_c * mid_c + 3) // 4
                      + (9 * mid_c + 3) // 4
                      + (mid_c * out_c + 3) // 4)
-        param_words = (mid_c + mid_c + out_c) * 4
-        if wgt_words > wgt_words_cap or param_words > param_words_cap:
+        max_stage_param_words = max(mid_c * 4, out_c * 4, 2 if has_add else 0)
+        if wgt_words > wgt_words_cap or max_stage_param_words > param_words_cap:
             i += 1
             continue
 
@@ -489,14 +510,15 @@ def apply_super_block_fusion(layers, profile: HWConfig = None,
                 tiles_w = (w + tw - 1) // tw
                 if (tiles_w - 1) * tw >= w:
                     continue
-                ifm_peak = max((th + 2) * (tw + 2) * in_c, th * tw * mid_c)
-                ofm_peak = max((th + 2) * (tw + 2) * mid_c, th * tw * out_c)
+                s2_out_aligned = ((th * tw * out_c + 3) // 4) * 4
+                ifm_peak = max((th + 2) * (tw + 2) * in_c,
+                               th * tw * mid_c,
+                               th * tw * out_c if has_add else 0)
+                ofm_peak = max((th + 2) * (tw + 2) * mid_c,
+                               (2 * s2_out_aligned) if has_add else (th * tw * out_c))
                 if ifm_peak > ifm_bytes or ofm_peak > ofm_bytes:
                     break  # both peaks grow monotonically with tw
                 ntiles = tiles_h * tiles_w
-                if ntiles <= 1:
-                    # Whole map fits super-block SRAM in 1 tile, or search keeps going
-                    pass
                 halo_pixels = ntiles * (th + 2) * (tw + 2)
                 dma_rows = ntiles * (th + 2)
                 cost = (ntiles, halo_pixels, dma_rows, abs(th - tw))
@@ -509,25 +531,30 @@ def apply_super_block_fusion(layers, profile: HWConfig = None,
             continue
 
         th, tw, nh, nw = best_hw
-        for idx_sub, x in enumerate((a, b, c)):
+        members = (a, b, c, d) if has_add else (a, b, c)
+        for idx_sub, x in enumerate(members):
             _lf_set(x, 'tile_h', th)
             _lf_set(x, 'tile_w', tw)
             _lf_set(x, 'tile_num_h', nh)
             _lf_set(x, 'tile_num_w', nw)
             sched = int(_lf_get(x, 'sched_ctrl', 0)) & ~0xFF
             sched |= _PTS
-            if idx_sub == 0:
+            if idx_sub == 0 or (has_add and idx_sub == 3):
                 sched |= _SUPER_BLOCK
             _lf_set(x, 'sched_ctrl', sched)
             if isinstance(x, dict):
                 x['store_mode'] = 1
-                in_th = (th - 1) * int(x['stride_h']) + int(x['kernel_h'])
-                in_tw = (tw - 1) * int(x['stride_w']) + int(x['kernel_w'])
+                kh_sub = 1 if idx_sub == 3 else int(x['kernel_h'])
+                kw_sub = 1 if idx_sub == 3 else int(x['kernel_w'])
+                sh_sub = 1 if idx_sub == 3 else int(x['stride_h'])
+                sw_sub = 1 if idx_sub == 3 else int(x['stride_w'])
+                in_th = (th - 1) * sh_sub + kh_sub
+                in_tw = (tw - 1) * sw_sub + kw_sub
                 x['tile_in_size'] = ((in_th * in_tw * int(x['in_c']) + 3) // 4) * 4
                 x['tile_out_size'] = ((th * tw * int(x['out_c']) + 3) // 4) * 4
                 x['row_cfg'] = (th << 16) | ((tw * int(x['out_c']) + 3) // 4)
         marked.append((i, th, tw, nh, nw))
-        i += 3
+        i += 4 if has_add else 3
 
     return marked
 
@@ -706,9 +733,11 @@ def apply_untiled_sram_fusion(layers, profile: HWConfig = None,
             return False
         if k > 0 and (int(_lf_get(layers[k - 1], 'sched_ctrl', 0)) & _FUSE_STRIP):
             return False
-        if k >= 2 and (int(_lf_get(layers[k - 2], 'sched_ctrl', 0)) & _SUPER_BLOCK):
+        if (k >= 2 and int(_lf_get(layers[k - 2], 'op_type', -1)) == 0
+                and (int(_lf_get(layers[k - 2], 'sched_ctrl', 0)) & _SUPER_BLOCK)):
             return False
-        if k >= 1 and (int(_lf_get(layers[k - 1], 'sched_ctrl', 0)) & _SUPER_BLOCK):
+        if (k >= 1 and int(_lf_get(layers[k - 1], 'op_type', -1)) == 0
+                and (int(_lf_get(layers[k - 1], 'sched_ctrl', 0)) & _SUPER_BLOCK)):
             return False
         ps = int(_lf_get(prod, 'sched_ctrl', 0))
         cs = int(_lf_get(cons, 'sched_ctrl', 0))
