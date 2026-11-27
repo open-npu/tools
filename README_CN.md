@@ -15,7 +15,7 @@
 | `tiling.py` | 空间 tiling 策略计算 |
 | `layer_fusion.py` | 层融合（Conv+BN+ReLU、Conv->Pool strip、SRAM chain） |
 | `super_tile.py` | 空间 Super-Block 融合规划 |
-| `hw_config.py` | 硬件配置参数 |
+| `hw_config.py` | 参数化硬件配置（MAC/DW 通道数、四库 SRAM 容量、`32/64/128-bit` WB/AXI4 DMA 总线） |
 | `ptq_mse_admm.py` | 转换器使用的 MSE clip / ADMM |
 
 ## 使用方法

@@ -23,7 +23,28 @@ class HWConfig:
     dw_parallel_ch: int = 8      # Depthwise channels processed in parallel
     has_int16: bool = True       # INT16 data type support
     has_lut: bool = True         # LUT activation support
-    ext_bw_bytes: int = 4        # External bus bandwidth (bytes/cycle)
+    ext_bw_bytes: int = 4        # External DMA bus bandwidth (bytes/cycle: 4=32b, 8=64b, 16=128b)
+    dma_bus_proto: str = 'wb'    # External DMA bus protocol ('wb' or 'axi4')
+
+    @property
+    def dma_bus_width(self) -> int:
+        return self.ext_bw_bytes * 8
+
+    @property
+    def hw_config_reg(self) -> int:
+        """Expected 32-bit REG_HW_CONFIG (0x018) value matching npu_csr.v."""
+        dw_enc = {32: 0, 64: 1, 128: 2}.get(self.dma_bus_width, 0)
+        proto_enc = 1 if self.dma_bus_proto == 'axi4' else 0
+        return (
+            (proto_enc << 29)
+            | (dw_enc << 27)
+            | ((1 if self.has_lut else 0) << 25)
+            | ((1 if self.has_int16 else 0) << 24)
+            | ((self.spad_total_kb & 0xFF) << 16)
+            | (3 << 12)  # acc_enc: 44-bit
+            | (1 << 8)   # ppu_enc: 8 lanes
+            | (self.mac_lanes & 0xFF)
+        )
 
     @property
     def macs_per_cycle(self) -> int:
@@ -67,7 +88,12 @@ def hw_config_from_args(args) -> HWConfig:
                         or legacy_array or DEFAULT_HW.dw_parallel_ch),
         has_int16=not getattr(args, 'no_int16', False),
         has_lut=DEFAULT_HW.has_lut,
-        ext_bw_bytes=getattr(args, 'ext_bw', None) or DEFAULT_HW.ext_bw_bytes,
+        ext_bw_bytes=(
+            (getattr(args, 'dma_bus_width', None) // 8)
+            if getattr(args, 'dma_bus_width', None)
+            else (getattr(args, 'ext_bw', None) or DEFAULT_HW.ext_bw_bytes)
+        ),
+        dma_bus_proto=(getattr(args, 'dma_bus_proto', None) or DEFAULT_HW.dma_bus_proto),
     )
 
 
@@ -95,3 +121,7 @@ def add_hw_args(parser):
                      help='Disable INT16 support (INT8 only)')
     grp.add_argument('--ext-bw', type=int, default=None,
                      help='External bus bandwidth in bytes/cycle (default: 4)')
+    grp.add_argument('--dma-bus-width', type=int, choices=[32, 64, 128], default=None,
+                     help='External DMA data bus width in bits (32, 64, or 128; default: 32)')
+    grp.add_argument('--dma-bus-proto', type=str, choices=['wb', 'axi4'], default=None,
+                     help='External DMA master protocol (wb or axi4; default: wb)')

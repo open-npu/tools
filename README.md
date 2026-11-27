@@ -13,7 +13,7 @@ Python toolchain for converting, quantizing, and packing neural network models f
 | `tiling.py` | Spatial tiling strategy computation |
 | `layer_fusion.py` | Layer fusion (Conv+BN+ReLU, Conv->Pool strip, SRAM chain) |
 | `super_tile.py` | Spatial super-block fusion planner |
-| `hw_config.py` | Hardware configuration parameters |
+| `hw_config.py` | Parameterizable hardware config (MAC/DW lanes, 4-bank SRAM sizes, `32/64/128-bit` WB/AXI4 DMA bus) |
 | `ptq_mse_admm.py` | MSE clip / ADMM helpers used by the converter |
 
 ## Usage
